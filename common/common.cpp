@@ -1238,6 +1238,60 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // Default-flip for discrete (non-unified-memory) Metal GPUs. With mmap, model weights are
+    // placed in Metal "Shared" host storage and read over the PCIe bus every token, which is
+    // ~10-18x slower than private VRAM on these cards (e.g. Radeon Pro 5700 XT). When the load
+    // mode is AUTO (the default), prefer no-mmap (weights -> private VRAM) if the model + KV +
+    // compute is projected to fit in the device's free VRAM; otherwise keep mmap so a model too
+    // large for VRAM still loads into shared host memory. Runs independently of -fit. Apple
+    // Silicon (unified memory) is unaffected: mmap is optimal there and this block is skipped.
+    if (mparams.load_mode == LLAMA_LOAD_MODE_AUTO && params.n_gpu_layers != 0 && !params.no_alloc) {
+        bool have_discrete_metal = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_props dp;
+            ggml_backend_dev_get_props(ggml_backend_dev_get(i), &dp);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+            if (reg && std::string(ggml_backend_reg_name(reg)) == "MTL" && // GGML_METAL_NAME
+                dp.type == GGML_BACKEND_DEVICE_TYPE_GPU && dp.caps.mmap_support && !dp.caps.unified_memory) {
+                have_discrete_metal = true;
+                break;
+            }
+        }
+        if (have_discrete_metal) {
+            try {
+                std::vector<ggml_backend_dev_t> est_devs;
+                uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+                common_device_memory_data_vec md = common_get_device_memory_data(
+                    params.model.path.c_str(), &mparams, &cparams, est_devs,
+                    hp_ngl, hp_n_ctx_train, hp_n_expert,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                bool fits = true;
+                for (size_t i = 0; i < est_devs.size() && i < md.size(); ++i) {
+                    ggml_backend_dev_props dp;
+                    ggml_backend_dev_get_props(est_devs[i], &dp);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(est_devs[i]);
+                    const bool is_discrete_metal = reg &&
+                        std::string(ggml_backend_reg_name(reg)) == "MTL" && !dp.caps.unified_memory; // GGML_METAL_NAME
+                    if (is_discrete_metal) {
+                        const size_t need   = md[i].model + md[i].context + md[i].compute;
+                        const size_t margin = (size_t) 512*1024*1024; // 512 MB VRAM headroom
+                        if (md[i].free <= 0 || need + margin > (size_t) md[i].free) {
+                            fits = false;
+                        }
+                    }
+                }
+                if (fits) {
+                    mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+                    COM_TRC("%s", "discrete Metal: model fits VRAM -> no-mmap (private VRAM); pass -lm mmap to override\n");
+                } else {
+                    COM_TRC("%s", "discrete Metal: model does not fit VRAM -> keeping mmap (shared host memory)\n");
+                }
+            } catch (const std::exception & e) {
+                COM_TRC("discrete Metal VRAM-fit probe failed (%s); leaving load mode on auto\n", e.what());
+            }
+        }
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");

@@ -158,6 +158,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // device memory is unified with host memory (so mmap'd weights are not read over a slow bus)
+        bool unified_memory;
     };
 
     // all the device properties
