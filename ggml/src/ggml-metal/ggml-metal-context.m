@@ -140,8 +140,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
         // MTLDispatchTypeConcurrent + memoryBarrierWithScope gives wrong results on AMD GPUs
-        // (Radeon Pro 5300M, Radeon Pro 5700 XT, see issue 19563), so only use it on Apple GPU families
-        res->use_concurrency = (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) && (props_dev->gpu_family > 0);
+        // (Radeon Pro 5300M, Radeon Pro 5700 XT, see issue 19563), so only use it on Apple GPU families.
+        // GGML_METAL_CONCURRENCY_FORCE is an experimental escape hatch to re-enable concurrency on
+        // non-Apple GPUs for benchmarking only (expected to produce garbage output on AMD; not for use).
+        res->use_concurrency = (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) &&
+            (props_dev->gpu_family > 0 || getenv("GGML_METAL_CONCURRENCY_FORCE") != nil);
 
         {
             const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
