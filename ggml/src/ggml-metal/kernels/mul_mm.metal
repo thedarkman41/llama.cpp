@@ -463,7 +463,7 @@ kernel void kernel_mul_mm_tiled(
         ushort tiitg [[thread_index_in_threadgroup]]) {
     constexpr short BM = 64;
     constexpr short BN = 128;
-    constexpr short BK = 16;
+    constexpr short BK = 32;
     constexpr short TM = 8;
     constexpr short TN = 8;
 

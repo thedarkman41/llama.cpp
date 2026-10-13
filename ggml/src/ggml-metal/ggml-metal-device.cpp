@@ -1016,7 +1016,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled(ggm
     // must match the tile constants in kernel_mul_mm_tiled (mul_mm.metal):
     // output tile BM(M) x BN(N), BK K-chunk, TM x TN micro-tile.
     // threads per threadgroup = (BM/TM)*(BN/TN); nsg = that / 32.
-    const int BM = 64, BN = 128, BK = 16, TM = 8, TN = 8;
+    const int BM = 64, BN = 128, BK = 32, TM = 8, TN = 8;
 
     res.nr0 = BM;
     res.nr1 = BN;
