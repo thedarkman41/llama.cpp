@@ -460,7 +460,7 @@ kernel void kernel_mul_mm_tiled(
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]]) {
-    constexpr short BM = 64;
+    constexpr short BM = 128;
     constexpr short BN = 128;
     constexpr short BK = 64;
     constexpr short TM = 8;
