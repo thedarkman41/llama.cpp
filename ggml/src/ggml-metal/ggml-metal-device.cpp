@@ -983,6 +983,51 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const ggml_type tsrc1 = op->src[1]->type;
+
+    GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
+    const int16_t ne12 = (int16_t) op->src[1]->ne[2];
+    const int16_t ne13 = (int16_t) op->src[1]->ne[3];
+    const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
+    const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+
+    snprintf(base, 256, "kernel_mul_mm_tiled_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(name, 256, "%s_ne12=%d_ne13=%d_r2=%d_r3=%d", base, ne12, ne13, r2, r3);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, ne12, FC_MUL_MM + 2);
+        ggml_metal_cv_set_int16(cv, ne13, FC_MUL_MM + 3);
+        ggml_metal_cv_set_int16(cv, r2,   FC_MUL_MM + 4);
+        ggml_metal_cv_set_int16(cv, r3,   FC_MUL_MM + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    // must match the tile constants in kernel_mul_mm_tiled (mul_mm.metal):
+    // output tile BM(M) x BN(N), BK K-chunk, TM x TN micro-tile.
+    // threads per threadgroup = (BM/TM)*(BN/TN); nsg = that / 32.
+    const int BM = 64, BN = 64, BK = 16, TM = 8, TN = 8;
+
+    res.nr0 = BM;
+    res.nr1 = BN;
+    res.nsg = ((BM/TM)*(BN/TN))/32;
+
+    // double-buffered: 2 x (As[BK][BM] + Bs[BK][BN]) halves
+    res.smem = 2*(BK*BM + BK*BN)*sizeof(ggml_fp16_t);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1305,6 +1350,40 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     }
 
     res.smem = 8192;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_tiled(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const ggml_type tsrc1 = op->src[1]->type;
+
+    snprintf(base, 256, "kernel_mul_mm_id_tiled_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(name, 256, "%s_amax=0", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, false, FC_MUL_MM + 6); // no amax rescale
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    // must match the tile constants in kernel_mul_mm_id_tiled (mul_mm.metal)
+    const int BM = 64, BN = 64, BK = 16, TM = 8, TN = 8;
+
+    res.nr0 = BM;
+    res.nr1 = BN;
+    res.nsg = ((BM/TM)*(BN/TN))/32;
+
+    // As[BK][BM] + Bs[BK][BN] halves (single-buffered)
+    res.smem = (BK*BM + BK*BN)*sizeof(ggml_fp16_t);
 
     return res;
 }
