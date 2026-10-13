@@ -1016,14 +1016,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled(ggm
     // must match the tile constants in kernel_mul_mm_tiled (mul_mm.metal):
     // output tile BM(M) x BN(N), BK K-chunk, TM x TN micro-tile.
     // threads per threadgroup = (BM/TM)*(BN/TN); nsg = that / 32.
-    const int BM = 64, BN = 128, BK = 32, TM = 8, TN = 8;
+    const int BM = 64, BN = 128, BK = 64, TM = 8, TN = 8;
 
     res.nr0 = BM;
     res.nr1 = BN;
     res.nsg = ((BM/TM)*(BN/TN))/32;
 
     // double-buffered: 2 x (As[BK][BM] + Bs[BK][BN]) halves
-    res.smem = 2*(BK*BM + BK*BN)*sizeof(ggml_fp16_t);
+    res.smem = (BK*BM + BK*BN)*sizeof(ggml_fp16_t);
 
     return res;
 }

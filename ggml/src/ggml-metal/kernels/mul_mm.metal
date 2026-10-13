@@ -463,7 +463,7 @@ kernel void kernel_mul_mm_tiled(
         ushort tiitg [[thread_index_in_threadgroup]]) {
     constexpr short BM = 64;
     constexpr short BN = 128;
-    constexpr short BK = 32;
+    constexpr short BK = 64;
     constexpr short TM = 8;
     constexpr short TN = 8;
 
@@ -484,13 +484,9 @@ kernel void kernel_mul_mm_tiled(
     const int ra = tgpig.y*BM; // first output row (M) of this tile
     const int rb = tgpig.x*BN; // first output col (N) of this tile
 
-    // double-buffered half shared memory: packed-fp16 math + prefetch pipeline
-    threadgroup half * Asb[2];
-    threadgroup half * Bsb[2];
-    Asb[0] = (threadgroup half *) shmem;
-    Asb[1] = Asb[0] + BK*BM;
-    Bsb[0] = Asb[1] + BK*BM;
-    Bsb[1] = Bsb[0] + BK*BN;
+    // single-buffered half shared memory
+    threadgroup half * As = (threadgroup half *) shmem;
+    threadgroup half * Bs = (threadgroup half *) shmem + BK*BM;
 
     device const T1 * ptrB = (device const T1 *)(src1 + args.nb12*i12 + args.nb13*i13);
     const int strideB = args.nb11/sizeof(T1);
@@ -506,25 +502,11 @@ kernel void kernel_mul_mm_tiled(
         }
     }
 
-    const int nTiles = (K + BK - 1)/BK;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, BM, BN, BK, NTHREAD>(
+            As, Bs, src0, ptrB, args.nb01, offset0, strideB, ra, rb, M, N, K, k0, tiitg);
 
-    // prefetch the first K-tile into buffer 0
-    mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, BM, BN, BK, NTHREAD>(
-        Asb[0], Bsb[0], src0, ptrB, args.nb01, offset0, strideB, ra, rb, M, N, K, 0, tiitg);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int t = 0; t < nTiles; t++) {
-        const short cur = t & 1;
-
-        // prefetch the next K-tile into the other buffer, overlapping the compute below
-        if (t + 1 < nTiles) {
-            mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, BM, BN, BK, NTHREAD>(
-                Asb[cur ^ 1], Bsb[cur ^ 1], src0, ptrB, args.nb01, offset0, strideB, ra, rb, M, N, K, (t + 1)*BK, tiitg);
-        }
-
-        threadgroup half * As = Asb[cur];
-        threadgroup half * Bs = Bsb[cur];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // packed-fp16 multiply, accumulate in half across this BK chunk
         half4 hacc[TM][TN/4];
