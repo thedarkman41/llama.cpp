@@ -139,6 +139,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mm
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled      (ggml_metal_library_t lib, const struct ggml_tensor * op, bool src1_f16);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool src1_f16, bool early);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mm_cvt_f32_f16    (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
@@ -311,6 +312,8 @@ struct ggml_metal_device_props {
     int gpu_family;
 
     int op_offload_min_batch_size;
+
+    int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

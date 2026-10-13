@@ -2831,7 +2831,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             b_nb13 = (uint64_t) ne10 * ne11 * ne12 * sizeof(ggml_fp16_t);
         }
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
+        // kernel_mul_mm_wc by default (GGML_METAL_MM_WC=0 selects kernel_mul_mm_tiled): same tile, grid and f16 scratch
+        auto pipeline = props_dev->mm_wc > 0
+            ? ggml_metal_library_get_pipeline_mul_mm_wc   (lib, op, use_f16_act, props_dev->mm_wc != 2)
+            : ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
+
+        if (props_dev->mm_wc > 0 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 32*pipeline.nsg) {
+            // cannot launch 256 threads: keep the baseline
+            pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
+        }
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,

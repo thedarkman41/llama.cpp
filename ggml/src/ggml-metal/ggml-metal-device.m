@@ -1283,6 +1283,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
                 dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
+                // tiled mul_mm: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
+                dev->props.mm_wc = getenv("GGML_METAL_MM_WC") ? atoi(getenv("GGML_METAL_MM_WC")) : 1;
+                if (dev->props.mm_wc != 1) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_WC=%d\n", __func__, dev->props.mm_wc);
+                }
+
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {

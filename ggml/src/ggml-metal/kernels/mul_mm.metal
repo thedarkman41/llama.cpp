@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_wc_early [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -589,6 +590,273 @@ template [[host_name("kernel_mul_mm_tiled_q4_K_f16")]]  kernel mul_mm_tiled_t ke
 template [[host_name("kernel_mul_mm_tiled_q5_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  half, half4>;
 template [[host_name("kernel_mul_mm_tiled_q6_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  half, half4>;
 template [[host_name("kernel_mul_mm_tiled_iq3_s_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, half, half4>;
+
+//
+// kernel_mul_mm_wc: kernel_mul_mm_tiled with a bank-conflict-free threadgroup data path (default; GGML_METAL_MM_WC=0 selects tiled)
+//
+// same 128x128 tile, BK = 64, 256 threads, 8x8 micro-tile, packed-half FMA, FP32 fold per chunk, grid and numerics
+// threadgroup memory holds K-major packed half2 words, 64 words per k-row:
+//   As[k][w]  = (A[w][k], A[w+64][k])   at word w (a wave-load touches 32 consecutive rows)
+//   Bs[k][np] = (B[2np][k], B[2np+1][k]) at word np ^ (((k >> 3) & 3) << 3)
+// staging stores are full words without bank conflicts (tiled: every B store is a 16-way conflict)
+// each inner-loop operand is one 16-byte read
+
+// 16 values of row `row` at k = kpos..kpos+15, zero outside the matrix
+template<
+    typename T0, typename T0_4x4, typename block_q, short nl,
+    void (*dequantize_func)(device const block_q *, short, thread T0_4x4 &)>
+T0_4x4 mm_wc_load_a(
+        device const char * src0,
+        uint64_t nb01,
+        uint64_t offset0,
+        int row, int M, int K, int kpos) {
+    T0_4x4 r;
+
+    if (row < M && kpos < K) {
+        if (is_same<T0_4x4, block_q>::value) {
+            device const T0 * p = (device const T0 *)(src0 + nb01*row + offset0) + kpos;
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                r[i/4][i%4] = (kpos + i < K) ? (half) p[i] : (half) 0;
+            }
+        } else {
+            device const block_q * p = (device const block_q *)(src0 + nb01*row + offset0);
+            dequantize_func(p + kpos/(16*nl), (short)((kpos/16) % nl), r);
+            if (kpos + 16 > K) {
+                FOR_UNROLL (int i = 0; i < 16; i++) {
+                    r[i/4][i%4] = (kpos + i < K) ? r[i/4][i%4] : (half) 0;
+                }
+            }
+        }
+    } else {
+        FOR_UNROLL (int i = 0; i < 16; i++) {
+            r[i/4][i%4] = (half) 0;
+        }
+    }
+
+    return r;
+}
+
+template<
+    typename T0, typename T0_4x4, typename block_q, short nl,
+    void (*dequantize_func)(device const block_q *, short, thread T0_4x4 &),
+    typename T1, typename T1_4>
+kernel void kernel_mul_mm_wc(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg_u [[thread_index_in_threadgroup]]) {
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int TM = 8;
+    constexpr int TN = 8;
+    constexpr int NW = 64; // packed words per k-row in As and Bs
+
+    // all index math in int: short address math miscompiles on this backend
+    const int tiitg = tiitg_u;
+
+    const int K = args.ne00;
+    const int M = args.ne0;
+    const int N = args.ne1;
+
+    const int im  = tgpig.z;
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    const int ra = tgpig.y*BM;
+    const int rb = tgpig.x*BN;
+
+    threadgroup uint * As = (threadgroup uint *) shmem;         // [BK][NW]
+    threadgroup uint * Bs = (threadgroup uint *) shmem + BK*NW; // [BK][NW], swizzled
+
+    device const T1 * ptrB = (device const T1 *)(src1 + args.nb12*i12 + args.nb13*i13);
+
+    const int  strideB  = args.nb11/sizeof(T1);
+    const bool b_vec_ok = strideB % 4 == 0;
+
+    // compute map, as kernel_mul_mm_tiled: rows TM*tr..TM*tr+7, cols TN*tc..TN*tc+7
+    const int tc = tiitg % (BN/TN);
+    const int tr = tiitg / (BN/TN);
+
+    // A staging: rows arp and arp+64 (one wave-load touches 32 consecutive rows), k = 16*aks..+15
+    const int arp = tiitg % 64;
+    const int aks = tiitg / 64;
+
+    // B staging: cols 2*bnp and 2*bnp+1, k octets bko and bko+4 (one wave = 8 col pairs x 4 octets)
+    const int lane = tiitg % 32;
+    const int bnp  = 8*(tiitg/32) + lane%8;
+    const int bko  = lane/8;
+    const int bcol = bnp ^ (bko << 3); // swizzle key (k >> 3) & 3 is bko for both octets
+    const int bn0  = rb + 2*bnp;
+
+    float4 acc[TN][TM/4]; // [col][rows 4i..4i+3]
+    FOR_UNROLL (int j = 0; j < TN; j++) {
+        FOR_UNROLL (int i = 0; i < TM/4; i++) {
+            acc[j][i] = float4(0.0f);
+        }
+    }
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (!FC_mul_mm_wc_early && k0 > 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        uint wa[16];
+        {
+            const int kpos = k0 + 16*aks;
+            const T0_4x4 r0 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + arp,      M, K, kpos);
+            const T0_4x4 r1 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + arp + 64, M, K, kpos);
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                wa[i] = as_type<uint>(half2(r0[i/4][i%4], r1[i/4][i%4]));
+            }
+        }
+
+        // late staging: store A before loading B to keep fewer registers live
+        if (!FC_mul_mm_wc_early) {
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                As[(16*aks + i)*NW + arp] = wa[i];
+            }
+        }
+
+        uint wb[16];
+        FOR_UNROLL (int t = 0; t < 2; t++) {
+            const int kb = k0 + 8*bko + 32*t;
+
+            half4 x0[2];
+            half4 x1[2];
+            if (b_vec_ok && bn0 + 1 < N && kb + 8 <= K) {
+                device const T1_4 * p0 = (device const T1_4 *)(ptrB + (size_t)(bn0 + 0)*strideB + kb);
+                device const T1_4 * p1 = (device const T1_4 *)(ptrB + (size_t)(bn0 + 1)*strideB + kb);
+                x0[0] = (half4) p0[0];
+                x0[1] = (half4) p0[1];
+                x1[0] = (half4) p1[0];
+                x1[1] = (half4) p1[1];
+            } else {
+                FOR_UNROLL (int c = 0; c < 8; c++) {
+                    x0[c/4][c%4] = (bn0 + 0 < N && kb + c < K) ? (half) ptrB[(size_t)(bn0 + 0)*strideB + kb + c] : (half) 0;
+                    x1[c/4][c%4] = (bn0 + 1 < N && kb + c < K) ? (half) ptrB[(size_t)(bn0 + 1)*strideB + kb + c] : (half) 0;
+                }
+            }
+
+            FOR_UNROLL (int c = 0; c < 8; c++) {
+                wb[8*t + c] = as_type<uint>(half2(x0[c/4][c%4], x1[c/4][c%4]));
+            }
+        }
+
+        // early staging: the global loads above overlap the slower waves of the previous chunk
+        if (FC_mul_mm_wc_early && k0 > 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // a wave writes 32 consecutive words (A) or 32 distinct banks (B)
+        if (FC_mul_mm_wc_early) {
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                As[(16*aks + i)*NW + arp] = wa[i];
+            }
+        }
+        FOR_UNROLL (int t = 0; t < 2; t++) {
+            FOR_UNROLL (int c = 0; c < 8; c++) {
+                Bs[(8*bko + 32*t + c)*NW + bcol] = wb[8*t + c];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        half4 hacc[TN][TM/4]; // [col TN*tc+j][rows TM*tr+4i..+3]
+        FOR_UNROLL (int j = 0; j < TN; j++) {
+            FOR_UNROLL (int i = 0; i < TM/4; i++) {
+                hacc[j][i] = half4(0.0h);
+            }
+        }
+
+        FOR_UNROLL (int kk = 0; kk < BK; kk++) {
+            const int xb = ((kk >> 3) & 3) << 3;
+
+            const uint4 ua = *((threadgroup const uint4 *)(As + kk*NW + 4*tr));
+            const uint4 ub = *((threadgroup const uint4 *)(Bs + kk*NW + ((4*tc) ^ xb)));
+
+            const half4 a0 = as_type<half4>(ua.xy); // rows {4tr, 4tr+64, 4tr+1, 4tr+65}
+            const half4 a1 = as_type<half4>(ua.zw); // rows {4tr+2, 4tr+66, 4tr+3, 4tr+67}
+            const half4 b0 = as_type<half4>(ub.xy); // cols TN*tc+0..3
+            const half4 b1 = as_type<half4>(ub.zw); // cols TN*tc+4..7
+
+            FOR_UNROLL (int j = 0; j < 4; j++) {
+                hacc[j + 0][0] = fma(half4(b0[j]), a0, hacc[j + 0][0]);
+                hacc[j + 0][1] = fma(half4(b0[j]), a1, hacc[j + 0][1]);
+                hacc[j + 4][0] = fma(half4(b1[j]), a0, hacc[j + 4][0]);
+                hacc[j + 4][1] = fma(half4(b1[j]), a1, hacc[j + 4][1]);
+            }
+        }
+
+        // fold the half partials (BK products) into FP32, as kernel_mul_mm_tiled
+        FOR_UNROLL (int j = 0; j < TN; j++) {
+            FOR_UNROLL (int i = 0; i < TM/4; i++) {
+                acc[j][i] += float4(hacc[j][i]);
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (size_t) im*N*M;
+
+    const bool m_vec = M % 4 == 0;
+
+    FOR_UNROLL (int j = 0; j < TN; j++) {
+        const int n = rb + TN*tc + j;
+        if (n < N) {
+            device float * D = dst_f32 + (size_t) n*M;
+            const float4 lo = float4(acc[j][0].x, acc[j][0].z, acc[j][1].x, acc[j][1].z); // rows 4tr..4tr+3
+            const float4 hi = float4(acc[j][0].y, acc[j][0].w, acc[j][1].y, acc[j][1].w); // rows 4tr+64..+67
+            FOR_UNROLL (int i = 0; i < 2; i++) {
+                const int m = ra + 4*tr + 64*i;
+                const float4 v = i == 0 ? lo : hi;
+                if (m_vec && m < M) {
+                    *((device float4 *)(D + m)) = v;
+                } else {
+                    FOR_UNROLL (int c = 0; c < 4; c++) {
+                        if (m + c < M) {
+                            D[m + c] = v[c];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_wc<half, half4x4, half4x4, 1, dequantize_f16, float, float4>) mul_mm_wc_t;
+
+template [[host_name("kernel_mul_mm_wc_f32_f32")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, float4x4,    1,     dequantize_f32,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_f16_f32")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, half4x4,     1,     dequantize_f16,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_q4_0_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_0,  2,     dequantize_q4_0,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q4_1_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_1,  2,     dequantize_q4_1,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q5_0_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_0,  2,     dequantize_q5_0,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q5_1_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_1,  2,     dequantize_q5_1,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q8_0_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q8_0,  2,     dequantize_q8_0,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q2_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q2_K,  QK_NL, dequantize_q2_K,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q3_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q3_K,  QK_NL, dequantize_q3_K,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q4_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_K,  QK_NL, dequantize_q4_K,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q5_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_q6_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq3_s_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4>;
+
+template [[host_name("kernel_mul_mm_wc_f32_f16")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, float4x4,    1,     dequantize_f32,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_f16_f16")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, half4x4,     1,     dequantize_f16,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_q4_0_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_0,  2,     dequantize_q4_0,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q4_1_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_1,  2,     dequantize_q4_1,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q5_0_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_0,  2,     dequantize_q5_0,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q5_1_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_1,  2,     dequantize_q5_1,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q8_0_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q8_0,  2,     dequantize_q8_0,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q2_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q2_K,  QK_NL, dequantize_q2_K,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q3_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q3_K,  QK_NL, dequantize_q3_K,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q4_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q4_K,  QK_NL, dequantize_q4_K,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q5_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_q6_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq3_s_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, half, half4>;
 
 // activation f32->f16 convert for the f16-activation tiled path (one pass, reused scratch)
 kernel void kernel_mm_cvt_f32_f16(
