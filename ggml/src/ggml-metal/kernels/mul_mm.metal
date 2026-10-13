@@ -701,9 +701,9 @@ kernel void kernel_mul_mm_id_tiled(
         // stage the B tile: gather one src1 row per token via hids
         for (short nloc = tiitg; nloc < BN; nloc += NTHREAD) {
             if (r1 + nloc < neh1) {
-                const int   id  = ids_i32[im*args.ne21 + r1 + nloc];
-                const short i11 = (id % args.ne20) % args.ne11;
-                const short i12 = (id / args.ne20);
+                const int id  = ids_i32[im*args.ne21 + r1 + nloc];
+                const int i11 = (id % args.ne20) % args.ne11;
+                const int i12 = (id / args.ne20);
                 device const T1 * yptr = (device const T1 *)(src1 + args.nb12*i12 + args.nb11*i11) + k0;
                 FOR_UNROLL (short kk = 0; kk < BK; kk++) {
                     Bs[kk*BN + nloc] = (k0 + kk < K) ? (half) ((float) yptr[kk] * s1_inv) : (half) 0;
@@ -763,9 +763,9 @@ kernel void kernel_mul_mm_id_tiled(
                 FOR_UNROLL (short lane = 0; lane < 4; lane++) {
                     const int nloc = tc*TN + 4*j + lane;
                     if (r1 + nloc < neh1) {
-                        const int   id  = ids_i32[im*args.ne21 + r1 + nloc];
-                        const short ide = id % args.ne20;
-                        const short idt = id / args.ne20;
+                        const int id  = ids_i32[im*args.ne21 + r1 + nloc];
+                        const int ide = id % args.ne20;
+                        const int idt = id / args.ne20;
                         dst_f32[m + ide*args.ne0 + (size_t) idt*args.ne1*args.ne0] = lanes[lane] * s1_scale;
                     }
                 }

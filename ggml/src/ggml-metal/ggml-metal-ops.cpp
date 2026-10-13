@@ -2983,10 +2983,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
 
-    // NOTE: the tiled MoE path is disabled - it produces NaN in token-tiles beyond
-    // the second (tokens >= 2*BN) for reasons not yet root-caused. MUL_MAT_ID falls
-    // back to the correct mul_mv_id path below. Set to true only to debug the tiled
-    // mul_mm_id kernel.
+    // NOTE: the tiled MoE path is correct now (kernel_mul_mm_id_tiled index locals are
+    // int, not short - short miscompiled the src1 address for token-tiles >= 2*BN), but
+    // it is left DISABLED: for sparse MoE (e.g. 128 experts, 8 used) the per-expert batch
+    // is small and the mul_mv_id fallback below is faster at every batch up to 512 tokens
+    // (op-level q4_K tiled 109/194/322/619/765 vs mul_mv_id 770/788/779/778/766 GFLOPS at
+    // n=32/64/128/256/512). grid.x is sized by total tokens so most per-expert tiles
+    // early-return; a permute-to-dense MoE kernel would be needed to beat mul_mv_id.
     const bool ggml_metal_tiled_mm_id_enabled = false;
 
     if (ggml_metal_tiled_mm_id_enabled &&
