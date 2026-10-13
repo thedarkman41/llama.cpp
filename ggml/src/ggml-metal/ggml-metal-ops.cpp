@@ -2608,6 +2608,35 @@ static bool ggml_metal_tiled_mm_supported(enum ggml_type t) {
     }
 }
 
+// Lever A: scratch for converting activations (src1) f32 -> f16 once, to halve the
+// B-staging VRAM traffic in the scalar tiled GEMM. Returned size is 0 unless this op
+// will take the tiled f16-activation path. The gate MUST match the dispatch below.
+size_t ggml_metal_op_mul_mat_extra_b_f16(const ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor) {
+    if (op->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    if (has_simdgroup_mm || has_tensor) {
+        return 0;
+    }
+    if (op->src[1]->ne[1] <= 8) { // ne11 (N); tiled path requires ne11 > 8
+        return 0;
+    }
+    if (ggml_is_transposed(op->src[0]) || ggml_is_transposed(op->src[1])) {
+        return 0;
+    }
+    if (!ggml_metal_tiled_mm_supported(op->src[0]->type)) {
+        return 0;
+    }
+    if (op->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!ggml_is_contiguous(op->src[1])) {
+        return 0;
+    }
+
+    return (size_t) ggml_nelements(op->src[1]) * sizeof(ggml_fp16_t);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2747,7 +2776,62 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 op->src[1]->type == GGML_TYPE_F32) {
         // scalar shared-memory tiled GEMM: third mul_mm path for GPUs with
         // neither simdgroup-matrix nor the tensor API (PoC: f16, q4_K)
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op);
+
+        // Lever A: when activations (src1) are contiguous f32, pre-convert them once
+        // into an f16 scratch (carved from this op's own dst buffer) and run the
+        // f16-activation kernel variant. The tiled kernel already truncates B to half on
+        // every staging read, so this is numerically identical while halving B-staging
+        // VRAM traffic (B is re-read ne01/BM times). Non-contiguous src1 falls back to
+        // the f32 variant.
+        const bool use_f16_act = ggml_is_contiguous(op->src[1]);
+
+        ggml_metal_buffer_id bid_b = ggml_metal_get_buffer_id(op->src[1]);
+
+        uint64_t b_nb10 = nb10;
+        uint64_t b_nb11 = nb11;
+        uint64_t b_nb12 = nb12;
+        uint64_t b_nb13 = nb13;
+
+        if (use_f16_act) {
+            const size_t n_elem = (size_t) ggml_nelements(op->src[1]);
+            GGML_ASSERT(n_elem <= UINT32_MAX);
+
+            // f16 scratch is reserved on this op's own dst buffer (see the GGML_OP_MUL_MAT
+            // case in ggml_backend_metal_buffer_type_get_alloc_size); it is resident and
+            // never reallocated mid-graph. Base is padded for aligned half4 loads.
+            ggml_metal_buffer_id bid_scratch = ggml_metal_get_buffer_id(op);
+            bid_scratch.offs += GGML_PAD(ggml_nbytes(op), 32);
+
+            // convert src1 (contiguous f32) -> scratch (contiguous f16), one pass
+            {
+                auto pipeline_cvt = ggml_metal_library_get_pipeline_mm_cvt_f32_f16(lib);
+
+                uint32_t ne_cvt = (uint32_t) n_elem;
+
+                const int nth = 256;
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_cvt);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_scratch, 1);
+                ggml_metal_encoder_set_bytes   (enc, &ne_cvt, sizeof(ne_cvt), 2);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, (int)((n_elem + nth - 1)/nth), 1, 1, nth, 1, 1);
+            }
+
+            // the GEMM reads the just-converted f16 B, so it must wait for the convert
+            ggml_metal_op_concurrency_reset(ctx);
+
+            bid_b = bid_scratch;
+
+            // contiguous f16 strides for the scratch B (kernel uses nb11/nb12/nb13;
+            // strideB = nb11/sizeof(T1) must equal K = ne10)
+            b_nb10 = sizeof(ggml_fp16_t);
+            b_nb11 = (uint64_t) ne10 * sizeof(ggml_fp16_t);
+            b_nb12 = (uint64_t) ne10 * ne11 * sizeof(ggml_fp16_t);
+            b_nb13 = (uint64_t) ne10 * ne11 * ne12 * sizeof(ggml_fp16_t);
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2756,10 +2840,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.nb02 =*/ nb02,
             /*.nb03 =*/ nb03,
             /*.ne12 =*/ ne12,
-            /*.nb10 =*/ nb10,
-            /*.nb11 =*/ nb11,
-            /*.nb12 =*/ nb12,
-            /*.nb13 =*/ nb13,
+            /*.nb10 =*/ b_nb10,
+            /*.nb11 =*/ b_nb11,
+            /*.nb12 =*/ b_nb12,
+            /*.nb13 =*/ b_nb13,
             /*.ne0  =*/ ne0,
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
@@ -2769,7 +2853,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_b,                                2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
@@ -2779,6 +2863,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+
+        if (use_f16_act) {
+            // protect the shared f16 scratch: the next op (e.g. another tiled matmul
+            // reusing this scratch) must not overwrite it before this GEMM finishes
+            // reading it. No-op cost in serial mode; needed under the concurrent encoder.
+            ggml_metal_op_concurrency_reset(ctx);
+        }
     } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 

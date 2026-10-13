@@ -983,12 +983,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mm_cvt_f32_f16(ggml_metal_library_t lib) {
+    const char * name = "kernel_mm_cvt_f32_f16";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tiled(ggml_metal_library_t lib, const ggml_tensor * op, bool src1_f16) {
     char base[256];
     char name[256];
 
     const ggml_type tsrc0 = op->src[0]->type;
-    const ggml_type tsrc1 = op->src[1]->type;
+    // src1_f16: activations pre-converted to f16 in a scratch buffer (Lever A),
+    // so select the _f16 kernel variant regardless of the op's declared src1 type.
+    const ggml_type tsrc1 = src1_f16 ? GGML_TYPE_F16 : op->src[1]->type;
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];

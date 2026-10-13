@@ -222,6 +222,17 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            {
+                // scalar tiled mul_mm f16-activation scratch (Lever A), carved from the
+                // op's own (resident) dst buffer. 0 on GPUs/shapes that don't take it.
+                ggml_metal_device_t dev = (ggml_metal_device_t) buft->device->context;
+                const ggml_metal_device_props * props = ggml_metal_device_get_props(dev);
+                const size_t extra = ggml_metal_op_mul_mat_extra_b_f16(tensor, props->has_simdgroup_mm, props->has_tensor);
+                if (extra > 0) {
+                    res = GGML_PAD(res, 32) + extra;
+                }
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);

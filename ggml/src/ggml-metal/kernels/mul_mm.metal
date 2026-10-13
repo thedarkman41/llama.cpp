@@ -381,7 +381,7 @@ kernel void kernel_mul_mm(
 template<
     typename T0, typename T0_4x4, typename block_q, short nl,
     void (*dequantize_func)(device const block_q *, short, thread T0_4x4 &),
-    typename T1, short BM, short BN, short BK, short NTHREAD>
+    typename T1, typename T1_4, short BM, short BN, short BK, short NTHREAD>
 void mm_tiled_stage(
         threadgroup half * As,
         threadgroup half * Bs,
@@ -429,17 +429,15 @@ void mm_tiled_stage(
         const int   gn    = rb + n;
         const int   kp    = k0 + kbase;
 
-        float4 v;
+        half4 vh;
         if (gn < N && kp + 3 < K) {
-            v = *(device const float4 *)(ptrB + (size_t) gn*strideB + kp);
+            vh = (half4)(*(device const T1_4 *)(ptrB + (size_t) gn*strideB + kp));
         } else {
-            v.x = (gn < N && kp + 0 < K) ? (float) ptrB[(size_t) gn*strideB + kp + 0] : 0.0f;
-            v.y = (gn < N && kp + 1 < K) ? (float) ptrB[(size_t) gn*strideB + kp + 1] : 0.0f;
-            v.z = (gn < N && kp + 2 < K) ? (float) ptrB[(size_t) gn*strideB + kp + 2] : 0.0f;
-            v.w = (gn < N && kp + 3 < K) ? (float) ptrB[(size_t) gn*strideB + kp + 3] : 0.0f;
+            vh.x = (gn < N && kp + 0 < K) ? (half) ptrB[(size_t) gn*strideB + kp + 0] : (half) 0;
+            vh.y = (gn < N && kp + 1 < K) ? (half) ptrB[(size_t) gn*strideB + kp + 1] : (half) 0;
+            vh.z = (gn < N && kp + 2 < K) ? (half) ptrB[(size_t) gn*strideB + kp + 2] : (half) 0;
+            vh.w = (gn < N && kp + 3 < K) ? (half) ptrB[(size_t) gn*strideB + kp + 3] : (half) 0;
         }
-
-        const half4 vh = (half4) v;
         Bs[(kbase + 0)*BN + n] = vh.x;
         Bs[(kbase + 1)*BN + n] = vh.y;
         Bs[(kbase + 2)*BN + n] = vh.z;
@@ -452,7 +450,8 @@ template<
     typename T0_4x4,   // 4x4 register produced by dequantize_func
     typename block_q, short nl,
     void (*dequantize_func)(device const block_q *, short, thread T0_4x4 &),
-    typename T1>       // src1 scalar
+    typename T1,       // src1 scalar
+    typename T1_4>     // src1 4-vector (float4 for f32 src1, half4 for f16 src1)
 kernel void kernel_mul_mm_tiled(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * src0,
@@ -503,7 +502,7 @@ kernel void kernel_mul_mm_tiled(
     }
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, BM, BN, BK, NTHREAD>(
+        mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, T1_4, BM, BN, BK, NTHREAD>(
             As, Bs, src0, ptrB, args.nb01, offset0, strideB, ra, rb, M, N, K, k0, tiitg);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -561,21 +560,46 @@ kernel void kernel_mul_mm_tiled(
     }
 }
 
-typedef decltype(kernel_mul_mm_tiled<half, half4x4, half4x4, 1, dequantize_f16, float>) mul_mm_tiled_t;
+typedef decltype(kernel_mul_mm_tiled<half, half4x4, half4x4, 1, dequantize_f16, float, float4>) mul_mm_tiled_t;
 
-template [[host_name("kernel_mul_mm_tiled_f32_f32")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, float4x4,   1,     dequantize_f32,   float>;
-template [[host_name("kernel_mul_mm_tiled_f16_f32")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, half4x4,    1,     dequantize_f16,   float>;
-template [[host_name("kernel_mul_mm_tiled_q4_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_0,  2,     dequantize_q4_0,  float>;
-template [[host_name("kernel_mul_mm_tiled_q4_1_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_1,  2,     dequantize_q4_1,  float>;
-template [[host_name("kernel_mul_mm_tiled_q5_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_0,  2,     dequantize_q5_0,  float>;
-template [[host_name("kernel_mul_mm_tiled_q5_1_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_1,  2,     dequantize_q5_1,  float>;
-template [[host_name("kernel_mul_mm_tiled_q8_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q8_0,  2,     dequantize_q8_0,  float>;
-template [[host_name("kernel_mul_mm_tiled_q2_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q2_K,  QK_NL, dequantize_q2_K,  float>;
-template [[host_name("kernel_mul_mm_tiled_q3_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q3_K,  QK_NL, dequantize_q3_K,  float>;
-template [[host_name("kernel_mul_mm_tiled_q4_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_K,  QK_NL, dequantize_q4_K,  float>;
-template [[host_name("kernel_mul_mm_tiled_q5_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float>;
-template [[host_name("kernel_mul_mm_tiled_q6_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float>;
-template [[host_name("kernel_mul_mm_tiled_iq3_s_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float>;
+template [[host_name("kernel_mul_mm_tiled_f32_f32")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, float4x4,   1,     dequantize_f32,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_f16_f32")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, half4x4,    1,     dequantize_f16,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q4_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_0,  2,     dequantize_q4_0,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q4_1_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_1,  2,     dequantize_q4_1,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q5_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_0,  2,     dequantize_q5_0,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q5_1_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_1,  2,     dequantize_q5_1,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q8_0_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q8_0,  2,     dequantize_q8_0,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q2_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q2_K,  QK_NL, dequantize_q2_K,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q3_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q3_K,  QK_NL, dequantize_q3_K,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q4_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_K,  QK_NL, dequantize_q4_K,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q5_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_q6_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq3_s_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4>;
+
+template [[host_name("kernel_mul_mm_tiled_f32_f16")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, float4x4,   1,     dequantize_f32,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_f16_f16")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, half4x4,    1,     dequantize_f16,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q4_0_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_0,  2,     dequantize_q4_0,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q4_1_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_1,  2,     dequantize_q4_1,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q5_0_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_0,  2,     dequantize_q5_0,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q5_1_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_1,  2,     dequantize_q5_1,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q8_0_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q8_0,  2,     dequantize_q8_0,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q2_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q2_K,  QK_NL, dequantize_q2_K,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q3_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q3_K,  QK_NL, dequantize_q3_K,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q4_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q4_K,  QK_NL, dequantize_q4_K,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q5_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_q6_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq3_s_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, half, half4>;
+
+// activation f32->f16 convert for the f16-activation tiled path (one pass, reused scratch)
+kernel void kernel_mm_cvt_f32_f16(
+        device const float * src [[buffer(0)]],
+        device       half  * dst [[buffer(1)]],
+        constant     uint  & ne  [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < ne) {
+        dst[gid] = (half) src[gid];
+    }
+}
 
 //
 // MoE: scalar shared-memory register-blocked tiled mul_mm_id (expert matmul)

@@ -31,6 +31,10 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // available ops:
 //
 
+// f16 activation scratch for the scalar tiled mul_mm path (Lever A); 0 if not taken.
+// must match the dispatch gate in ggml_metal_op_mul_mat exactly.
+size_t ggml_metal_op_mul_mat_extra_b_f16(const struct ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor);
+
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
