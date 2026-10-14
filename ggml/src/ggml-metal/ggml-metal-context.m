@@ -40,6 +40,7 @@ struct ggml_metal {
 
     bool use_concurrency;
     bool use_graph_optimize;
+    bool cb_serial; // encode the command buffers one after another on the calling thread
 
     int debug_graph;
     int profile_ops; // GGML_METAL_PROFILE_OPS: per-op GPU time, each op encoded in its own command buffer
@@ -67,6 +68,7 @@ struct ggml_metal {
     int n_nodes_0;      // number of nodes submitted by the main thread
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
     int n_nodes_per_cb;
+    int cb_end[GGML_METAL_MAX_COMMAND_BUFFERS]; // serial encoding: end node of each of the n_cb command buffers
 
     struct ggml_cgraph * gf;
 
@@ -157,6 +159,14 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->use_concurrency = (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) &&
             (props_dev->gpu_family > 0 || getenv("GGML_METAL_CONCURRENCY_FORCE") != nil);
 
+        // non-Apple GPUs: split the rest of the graph into several command buffers that the calling thread
+        // encodes in order, committing each one when it is encoded. the GPU then starts on the first while the
+        // others are still being encoded, instead of idling until the whole graph is encoded (parallel encoding
+        // threads do not help there). GGML_METAL_CB_SERIAL=0/1 overrides
+        res->cb_serial = props_dev->gpu_family == 0;
+        if (getenv("GGML_METAL_CB_SERIAL")) {
+            res->cb_serial = atoi(getenv("GGML_METAL_CB_SERIAL")) != 0;
+        }
 
         {
             const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -708,7 +718,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     const int64_t pcb_t0 = ctx->profile_cb ? ggml_time_us() : 0;
 
     // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    // serial encoding: a short first command buffer gets the GPU going sooner
+    const int n_main = ctx->cb_serial ? 32 : MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
@@ -720,6 +731,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
     // each thread creates it's own command buffer and enqueues the ops in parallel
+    // (cb_serial: the calling thread encodes and commits the n_cb command buffers in order instead)
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
 
@@ -737,6 +749,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
 
+            if (ctx->cb_serial) {
+                // growing command buffers: each one is encoded while the GPU runs the previous ones
+                // (encoding a node is ~5x faster than running it in a decode graph)
+                int end = ctx->n_nodes_0;
+                int len = ctx->n_nodes_0;
+                for (int i = 0; i < ctx->n_cb; ++i) {
+                    len *= 3;
+                    end  = i == ctx->n_cb - 1 ? gf->n_nodes : MIN(end + len, gf->n_nodes);
+                    ctx->cb_end[i] = end;
+                }
+            }
         }
 
         if (ctx->capture_compute >= 0) {
@@ -812,7 +835,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
-            if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            if (cb_idx < 2 || ctx->abort_callback == NULL || ctx->cb_serial) {
                 [cmd_buf enqueue];
 
                 // update the pointer to the last queued command buffer
@@ -821,7 +844,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
-        dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        if (ctx->cb_serial) {
+            // in order on this thread: each command buffer is committed as soon as it is encoded
+            for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+                ctx->encode_async(cb_idx);
+            }
+        } else {
+            dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        }
 
         if (ctx->profile_cb) {
             ctx->pcb_enc_main += 1e-6*(pcb_t1 - pcb_t0);
@@ -940,6 +970,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // serial encoding: the rest of the graph goes into 4 growing command buffers
+    if (ctx->cb_serial && n_cb > 0) {
+        n_cb = 4;
+    }
+
     // when fusion stats are collected the graph must be encoded by a single thread so the
     // counters are race-free; override whatever the caller requested
     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
@@ -949,7 +984,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
-        if (ctx->n_cb > 2) {
+        if (ctx->n_cb > 2 && !ctx->cb_serial) {
             GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
         }
     }
@@ -973,6 +1008,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         if (cb_idx < n_cb_l) {
             idx_start = n_nodes_0 + (                                         (cb_idx + 0) * n_nodes_per_cb);
             idx_end   = n_nodes_0 + (MIN((cb_idx == n_cb_l - 1) ? n_nodes_1 : (cb_idx + 1) * n_nodes_per_cb, n_nodes_1));
+
+            if (ctx->cb_serial) {
+                idx_start = cb_idx == 0 ? n_nodes_0 : ctx->cb_end[cb_idx - 1];
+                idx_end   = ctx->cb_end[cb_idx];
+            }
         }
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
@@ -999,7 +1039,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
-        if (cb_idx < 2 || ctx->abort_callback == NULL) {
+        // the main thread's command buffer (cb_idx == n_cb) is always committed, otherwise the queue stalls
+        // behind it; in serial mode nothing is deferred
+        if (cb_idx == n_cb_l || cb_idx < 2 || ctx->abort_callback == NULL || ctx->cb_serial) {
             [cmd_buf commit];
         }
     });
