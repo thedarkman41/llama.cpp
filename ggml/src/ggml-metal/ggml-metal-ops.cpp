@@ -1750,10 +1750,25 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
 
+    // prefill: 32 channels x 64 tokens per threadgroup, coalesced loads and stores
+    const bool use_tiled = (ne1 >= 32);
+
     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
     const bool use_batched = (ne1 > 1);
 
-    if (use_batched) {
+    if (use_tiled) {
+        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_tiled(lib, op, (int32_t) ne10, use_silu);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 31)/32, (ne1 + 63)/64, ne02, 32, 8, 1);
+    } else if (use_batched) {
         // Determine the smallest power of 2 that's >= ne1, but <= 256
         int BATCH_SIZE;
         if      (ne1 > 128) BATCH_SIZE = 256;

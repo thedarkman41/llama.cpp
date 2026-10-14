@@ -160,6 +160,85 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
+// prefill: a threadgroup computes 32 channels x SSM_CONV_TT tokens. the conv input rows are
+// staged through threadgroup memory (loads along tokens), then each lane owns one channel, so
+// the output stores (channels are contiguous in dst) are coalesced as well
+// threadgroup: 32x8, grid: (ceil(ne01/32), ceil(ne1/SSM_CONV_TT), ne02)
+// smem: 32*SSM_CONV_LD(nc) floats
+#define SSM_CONV_TT 64
+#define SSM_CONV_LD(nc) ((SSM_CONV_TT + (nc) - 1) | 1) // odd pitch: conflict-free column reads
+
+template<bool V4>
+kernel void kernel_ssm_conv_f32_f32_tiled_impl(
+        constant ggml_metal_kargs_ssm_conv & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int nc = FC_ssm_conv_nc;
+    const int ld = SSM_CONV_LD(nc);
+
+    const int ir0 = tgpig.x*32;
+    const int it0 = tgpig.y*SSM_CONV_TT;
+    const int i3  = tgpig.z;
+
+    for (int r = tpitg.y; r < 32; r += 8) {
+        const int ir = ir0 + r;
+        if (ir >= args.ne01) {
+            break;
+        }
+
+        device const float * s = (device const float *) ((device const char *) src0 + ir*args.nb01 + i3*args.nb02);
+
+        for (int t = tpitg.x; t < SSM_CONV_TT + nc - 1; t += 32) {
+            shmem[r*ld + t] = it0 + t < args.ne00 ? s[it0 + t] : 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ir = ir0 + tpitg.x;
+    if (ir >= args.ne01) {
+        return;
+    }
+
+    device const float * c = (device const float *) ((device const char *) src1 + ir*args.nb11);
+
+    constexpr int TPT = SSM_CONV_TT/8; // tokens per thread
+
+    for (int j = tpitg.y*TPT; j < (tpitg.y + 1)*TPT; ++j) {
+        const int i2 = it0 + j;
+        if (i2 >= args.ne1) {
+            break;
+        }
+
+        threadgroup const float * s = shmem + tpitg.x*ld + j;
+
+        // same summation order as kernel_ssm_conv_f32_f32{,_4}
+        float sumf = 0.0f;
+        if (V4) {
+            FOR_UNROLL (int i0 = 0; i0 < nc/4; ++i0) {
+                sumf += dot(float4(s[4*i0 + 0], s[4*i0 + 1], s[4*i0 + 2], s[4*i0 + 3]), ((device const float4 *) c)[i0]);
+            }
+        } else {
+            FOR_UNROLL (int i0 = 0; i0 < nc; ++i0) {
+                sumf += s[i0] * c[i0];
+            }
+        }
+
+        device float * x = (device float *) ((device char *) dst + ir*args.nb0 + i2*args.nb1 + i3*args.nb2);
+
+        x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+    }
+}
+
+typedef decltype(kernel_ssm_conv_f32_f32_tiled_impl<false>) kernel_ssm_conv_tiled_t;
+
+template [[host_name("kernel_ssm_conv_f32_f32_tiled")]]   kernel kernel_ssm_conv_tiled_t kernel_ssm_conv_f32_f32_tiled_impl<false>;
+template [[host_name("kernel_ssm_conv_f32_f32_tiled_4")]] kernel kernel_ssm_conv_tiled_t kernel_ssm_conv_f32_f32_tiled_impl<true>;
+
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values
 // TAIL == false is the whole-sequence / decode path: token_offset folds away at compile time.

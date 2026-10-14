@@ -10540,6 +10540,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // prefill: partial channel/token tiles and multiple sequences
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {515, 8192, 1, 1}, {4, 8192, 1, 1})); // qwen3.5 moe pp512
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + 100, 1000, 3, 1}, {4, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 + 129, 1000, 2, 1}, {3, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {7 + 100, 1000, 2, 1}, {8, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {8 + 33, 1000, 2, 1}, {9, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 8192, 1, 1}, {4, 8192, 1, 1}, false));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + 100, 1000, 3, 1}, {4, 1000, 1, 1}, true));
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 16, 8, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // d_state=96 SSD multi-chunk (partial 2nd chunk, 2 seqs)
