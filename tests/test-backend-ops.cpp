@@ -10771,12 +10771,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   64, 1, 1024, {3, 2}, {2, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2050, 1,  768, {3, 2}, {2, 1}));
     }
-    // Metal kernel_mul_mm_wc dq2 loaders (q3_K, q4_K): odd m (row tails; m = 48 < 64 at n = 512), odd superblock count,
-    // every tile width, split-K starting inside a block (m = 129, 256 and 1001 at small n; m = 129 k = 1280 splits K
-    // in 4 starting at 64/128/192 mod 256), broadcast batches, strided batches, padded rows
-    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
+    // Metal kernel_mul_mm_wc dq2 loaders (q3_K, q4_K, q6_K, iq4_xs, iq3_s, iq3_xxs, iq2_s): odd m (row tails; m = 48
+    // and 4 < 64 at n = 512, m = 4 clamps all but 4 tile rows), odd superblock count, a single block (k = 256), every
+    // tile width, split-K starting inside a block (m = 129, 256 and 1001 at small n; m = 129 k = 1280 splits K in 4
+    // starting at 64/128/192 mod 256, k = 2304 in 8), broadcast batches, strided batches, padded rows (non-contiguous
+    // src1: the f32-activation variant)
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S}) {
         for (int64_t n : {9, 33, 100, 512}) {
-            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{48, 5120}, {129, 768}, {129, 1280}, {1001, 1280}, {256, 3328}, {4100, 256}}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{48, 5120}, {4, 16384}, {129, 256}, {129, 768}, {129, 1280}, {129, 2304},
+                                                                        {1001, 1280}, {256, 3328}, {4100, 256}}) {
                 if (m < 128 && n < 512) {
                     continue; // below 2^25 multiply-adds a small m takes the mat-vec path, not kernel_mul_mm_wc
                 }
@@ -12362,6 +12365,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{5120, 17408}, {10240, 5120}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 512, k, {1, 1}, {1, 1}));
+    }
+    // qwen3.6-35B-A3B q6_K and qwen3.8-27B UD IQ prefill shapes (pp512)
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{8192, 2048}, {2048, 4096}, {4096, 2048}, {512, 2048}, {2048, 512}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 512, k, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 512, k, {1, 1}, {1, 1}));
+        }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 1, 2048));

@@ -3030,11 +3030,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // split-K (kernel_mul_mm_wc only) for grids with few tiles
         int ks = ggml_metal_op_mul_mat_ks(op, props_dev);
 
-        // dq2 A loaders of kernel_mul_mm_wc (GGML_METAL_MM_DQ2): q3_K reads ushorts, q4_K reads the 16-byte block header as one uint4
+        // dq2 A loaders of kernel_mul_mm_wc (GGML_METAL_MM_DQ2): q4_K reads the 16-byte block header as one uint4, iq4_xs reads uint2s,
+        // the others read ushorts
         const uint64_t al0 = ggml_metal_get_buffer_id(op->src[0]).offs | nb01 | nb02 | nb03;
         const bool dq2 =
-            (op->src[0]->type == GGML_TYPE_Q3_K && (props_dev->mm_dq2 & 1) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_Q4_K && (props_dev->mm_dq2 & 2) && al0 % 16 == 0);
+            (op->src[0]->type == GGML_TYPE_Q3_K    && (props_dev->mm_dq2 & 0x01) && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_Q4_K    && (props_dev->mm_dq2 & 0x02) && al0 % 16 == 0) ||
+            (op->src[0]->type == GGML_TYPE_Q6_K    && (props_dev->mm_dq2 & 0x04) && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ4_XS  && (props_dev->mm_dq2 & 0x08) && al0 % 8  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ3_S   && (props_dev->mm_dq2 & 0x10) && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ3_XXS && (props_dev->mm_dq2 & 0x20) && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ2_S   && (props_dev->mm_dq2 & 0x40) && al0 % 2  == 0);
 
         // kernel_mul_mm_wc by default (GGML_METAL_MM_WC=0 selects kernel_mul_mm_tiled): same tile, grid and f16 scratch
         auto pipeline = props_dev->mm_wc > 0

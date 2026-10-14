@@ -10,7 +10,7 @@ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant bool FC_mul_mm_wc_early [[function_constant(FC_MUL_MM + 7)]];
 constant short FC_mul_mm_wc_ks   [[function_constant(FC_MUL_MM + 8)]]; // kernel_mul_mm_wc: K splits (1 = off)
-constant bool  FC_mul_mm_wc_dq2  [[function_constant(FC_MUL_MM + 9)]]; // kernel_mul_mm_wc: q3_K/q4_K A loader mm_wc_dq2_row
+constant bool  FC_mul_mm_wc_dq2  [[function_constant(FC_MUL_MM + 9)]]; // kernel_mul_mm_wc: dq2 A loaders (mm_wc_dq2_row, mm_wc_dq2_load/_dec)
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -753,6 +753,194 @@ void mm_wc_dq2_row(device const block_q4_K * xb, int c, int aks, thread float4 *
     v[3] = fma(float4(as_type<uchar4>(qq.y & 0xF0F0F0F0u)), float4(dl1), float4(-ml1));
 }
 
+// split dq2 loaders (q6_K, iq4_xs, iq3_s, iq3_xxs, iq2_s): mm_wc_dq2_load reads the raw words of a row, mm_wc_dq2_dec
+// makes v[] as mm_wc_dq2_row does (both rows are loaded before either is decoded). iq3_s, iq3_xxs, iq2_s put the unsigned
+// products in v[] and the sign bits in sg (bit i for the staged word wa[i]): the kernel flips the sign of the f16 value,
+// as the -1 factor of dequantize_iq* does, also for a NaN
+#define MM_WC_DQ2_NR 8
+
+template<typename block_q>
+void mm_wc_dq2_load(device const block_q * xb, int c, int aks, thread uint * r) {
+}
+
+template<typename block_q>
+void mm_wc_dq2_dec(device const block_q *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    FOR_UNROLL (int i = 0; i < 4; i++) {
+        v[i] = float4(0.0f);
+    }
+    sg = 0;
+}
+
+// q6_K chunk c: half n = c/2, fields j = 2*(c%2) + {0, 1}, weight 128*n + 32*j + l (l = 0..31)
+// q = ((ql[64*n + 32*(j%2) + l] >> 4*(j/2)) & 0xF) | (((qh[32*n + l] >> 2*j) & 3) << 4), x = d*sc*(q - 32), sc = scales[8*n + 2*j + l/16]
+// lane aks: l = 8*aks..8*aks + 7 of both fields
+// (all products are exact in f32, so the f16 result equals dequantize_q6_K's)
+// blocks are 2-byte aligned: ushort loads only
+void mm_wc_dq2_load(device const block_q6_K * xb, int c, int aks, thread uint * r) {
+    const int n = c/2;
+    const int p = c%2;
+
+    device const ushort * l16 = (device const ushort *) xb->ql + 32*n + 4*aks;
+    device const ushort * h16 = (device const ushort *) xb->qh + 16*n + 4*aks;
+    device const ushort * s16 = (device const ushort *) xb->scales + 4*n + 2*p;
+
+    r[0] = (uint) l16[ 0] | ((uint) l16[ 1] << 16); // ql[64*n + 8*aks + 0..3]
+    r[1] = (uint) l16[ 2] | ((uint) l16[ 3] << 16);
+    r[2] = (uint) l16[16] | ((uint) l16[17] << 16); // ql[64*n + 32 + 8*aks + 0..3]
+    r[3] = (uint) l16[18] | ((uint) l16[19] << 16);
+    r[4] = (uint) h16[ 0] | ((uint) h16[ 1] << 16); // qh[32*n + 8*aks + 0..3]
+    r[5] = (uint) h16[ 2] | ((uint) h16[ 3] << 16);
+    r[6] = (uint) s16[ 0] | ((uint) s16[ 1] << 16); // scales[8*n + 4*p + 0..3]
+    r[7] = as_type<ushort>(xb->d);
+}
+
+void mm_wc_dq2_dec(device const block_q6_K *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    const int sh = 4*(c%2);
+
+    // int8 scales[8*n + 4*p + aks/2] (field 2*p) and scales[8*n + 4*p + 2 + aks/2] (field 2*p + 1)
+    const float d   = (float) as_type<half>((ushort) r[7]);
+    const float dl0 = d*(float) (((int) (r[6] << (24 - 8*(aks/2)))) >> 24);
+    const float dl1 = d*(float) (((int) (r[6] << ( 8 - 8*(aks/2)))) >> 24);
+
+    const uint u0 = ((r[0] >> sh) & 0x0F0F0F0Fu) | (((r[4] >> sh) << 4) & 0x30303030u);
+    const uint u1 = ((r[1] >> sh) & 0x0F0F0F0Fu) | (((r[5] >> sh) << 4) & 0x30303030u);
+    const uint u2 = ((r[2] >> sh) & 0x0F0F0F0Fu) | (((r[4] >> sh) << 2) & 0x30303030u);
+    const uint u3 = ((r[3] >> sh) & 0x0F0F0F0Fu) | (((r[5] >> sh) << 2) & 0x30303030u);
+
+    v[0] = fma(float4(as_type<uchar4>(u0)), float4(dl0), float4(-32.0f*dl0));
+    v[1] = fma(float4(as_type<uchar4>(u1)), float4(dl0), float4(-32.0f*dl0));
+    v[2] = fma(float4(as_type<uchar4>(u2)), float4(dl1), float4(-32.0f*dl1));
+    v[3] = fma(float4(as_type<uchar4>(u3)), float4(dl1), float4(-32.0f*dl1));
+    sg = 0;
+}
+
+// iq4_xs chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = nibble l/16 of qs[16*ib + l%16]
+// lane aks: bytes qs[32*c + 8*(aks%2) + 0..7] and qs[32*c + 16 + 8*(aks%2) + 0..7], nibble aks/2
+// x = d*(ls - 32)*kvalues_iq4nl[q]: the products are exact in f32, so the f16 result equals dequantize_iq4_xs's
+// blocks are 8-byte aligned (the host checks the offset and the strides)
+void mm_wc_dq2_load(device const block_iq4_xs * xb, int c, int aks, thread uint * r) {
+    const uint2 hdr = *((device const uint2 *) xb); // d, scales_h, scales_l[0..3]
+    device const uint2 * q2 = (device const uint2 *) (xb->qs + 32*c + 8*(aks%2));
+    const uint2 qa = q2[0];
+    const uint2 qb = q2[2];
+
+    r[0] = hdr.x;
+    r[1] = hdr.y;
+    r[2] = qa.x;
+    r[3] = qa.y;
+    r[4] = qb.x;
+    r[5] = qb.y;
+}
+
+void mm_wc_dq2_dec(device const block_iq4_xs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    const uint ls0 = ((r[1] >> (8*c    )) & 0xF) | (((r[0] >> (16 + 4*c)) & 3) << 4);
+    const uint ls1 = ((r[1] >> (8*c + 4)) & 0xF) | (((r[0] >> (18 + 4*c)) & 3) << 4);
+
+    const float d   = (float) as_type<half2>(r[0])[0];
+    const float dl0 = d*(float) ((int) ls0 - 32);
+    const float dl1 = d*(float) ((int) ls1 - 32);
+
+    const int sh = 4*(aks/2);
+    FOR_UNROLL (int i = 0; i < 4; i++) {
+        const uchar4 q  = as_type<uchar4>((r[2 + i] >> sh) & 0x0F0F0F0Fu);
+        const float  dl = i < 2 ? dl0 : dl1;
+        v[i] = dl*float4(kvalues_iq4nl_f[q[0]], kvalues_iq4nl_f[q[1]], kvalues_iq4nl_f[q[2]], kvalues_iq4nl_f[q[3]]);
+    }
+    sg = 0;
+}
+
+// iq3_s chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%4 of iq3s_grid[qs[8*ib + l/4] | bit l/4 of qh[ib] << 8],
+// negative if bit l%8 of signs[4*ib + l/8] is set, scale d*(1 + 2*nibble ib%2 of scales[ib/2])
+// lane aks: grid entries 2*aks, 2*aks + 1 and sign byte aks of both sub-blocks
+// (the products are exact in f32, so the f16 result equals dequantize_iq3_s's)
+// blocks are 2-byte aligned: ushort loads only
+void mm_wc_dq2_load(device const block_iq3_s * xb, int c, int aks, thread uint * r) {
+    device const ushort * x16 = (device const ushort *) xb;
+
+    r[0] = (uint) x16[ 1 + 8*c + aks]   | ((uint) x16[ 5 + 8*c + aks]   << 16); // qs[16*c + 2*aks + 0..1], qs[16*c + 8 + 2*aks + 0..1]
+    r[1] = (uint) x16[33 + c]           | ((uint) x16[53 + c/2]         << 16); // qh[2*c..2*c + 1], scales[2*(c/2)..+1]
+    r[2] = (uint) x16[37 + 4*c + aks/2] | ((uint) x16[39 + 4*c + aks/2] << 16); // signs[8*c + aks], signs[8*c + 4 + aks] in byte aks%2
+    r[3] = as_type<ushort>(xb->d);
+}
+
+void mm_wc_dq2_dec(device const block_iq3_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    const uint qh = r[1];
+    const uint sc = r[1] >> (16 + 8*(c%2));
+    const uint s  = r[2] >> (8*(aks%2)); // sign byte of sub-block 2*c in bits 0..7, of 2*c + 1 in bits 16..23
+
+    const float d   = (float) as_type<half>((ushort) r[3]);
+    const float dl0 = d*(float) (1 + 2*(int) ( sc       & 0xF));
+    const float dl1 = d*(float) (1 + 2*(int) ((sc >> 4) & 0xF));
+
+    FOR_UNROLL (int i = 0; i < 4; i++) {
+        const uint  g  = iq3s_grid[((r[0] >> 8*i) & 0xFF) | (((qh >> (8*(i/2) + 2*aks + i%2)) & 1) << 8)];
+        const float dl = i < 2 ? dl0 : dl1;
+        v[i] = dl*float4(as_type<uchar4>(g));
+    }
+    sg = (s & 0xFF) | ((s >> 8) & 0xFF00);
+}
+
+// iq3_xxs chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%4 of iq3xxs_grid[qs[8*ib + l/4]],
+// sign bit l%8 of ksigns_iq2xs[bits 7*(l/8)..+6 of aux], scale d*(0.5 + aux >> 28)*0.5, aux = uint32 at qs[64 + 4*ib]
+// lane aks: grid entries 2*aks, 2*aks + 1 and sign group aks of both sub-blocks
+// (the products are exact in f32, so the f16 result equals dequantize_iq3_xxs's)
+// blocks are 2-byte aligned: ushort loads only
+void mm_wc_dq2_load(device const block_iq3_xxs * xb, int c, int aks, thread uint * r) {
+    device const ushort * x16 = (device const ushort *) xb;
+
+    r[0] = (uint) x16[ 1 + 8*c + aks] | ((uint) x16[ 5 + 8*c + aks] << 16); // qs[16*c + 2*aks + 0..1], qs[16*c + 8 + 2*aks + 0..1]
+    r[1] = (uint) x16[33 + 4*c]       | ((uint) x16[34 + 4*c]       << 16); // aux of sub-block 2*c
+    r[2] = (uint) x16[35 + 4*c]       | ((uint) x16[36 + 4*c]       << 16); // aux of sub-block 2*c + 1
+    r[3] = as_type<ushort>(xb->d);
+}
+
+void mm_wc_dq2_dec(device const block_iq3_xxs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    const float d = (float) as_type<half>((ushort) r[3]);
+
+    sg = 0;
+    FOR_UNROLL (int h = 0; h < 2; h++) {
+        const uint  aux = r[1 + h];
+        const float dl  = d*(0.5f + (float) (aux >> 28))*0.5f;
+        const uint  s7  = (aux >> (7*aks)) & 127;
+
+        sg |= (s7 | ((popcount(s7) & 1) << 7)) << 8*h; // ksigns_iq2xs[s7]
+
+        FOR_UNROLL (int i = 0; i < 2; i++) {
+            v[2*h + i] = dl*float4(as_type<uchar4>(iq3xxs_grid[(r[0] >> (16*h + 8*i)) & 0xFF]));
+        }
+    }
+}
+
+// iq2_s chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%8 of iq2s_grid[qs[4*ib + l/8] | ((qh[ib] >> 2*(l/8)) & 3) << 8],
+// negative if bit l%8 of qs[32 + 4*ib + l/8] is set, scale d*(0.5 + nibble l/16 of scales[ib])*0.25
+// lane aks: grid entry aks and sign byte aks of both sub-blocks
+// (the products are exact in f32, so the f16 result equals dequantize_iq2_s's)
+// blocks are 2-byte aligned: ushort loads only
+void mm_wc_dq2_load(device const block_iq2_s * xb, int c, int aks, thread uint * r) {
+    device const ushort * x16 = (device const ushort *) xb;
+
+    r[0] = (uint) x16[ 1 + 4*c + aks/2] | ((uint) x16[ 3 + 4*c + aks/2] << 16); // qs[8*c + aks], qs[8*c + 4 + aks] in byte aks%2
+    r[1] = (uint) x16[17 + 4*c + aks/2] | ((uint) x16[19 + 4*c + aks/2] << 16); // signs qs[32 + 8*c + aks], qs[32 + 8*c + 4 + aks]
+    r[2] = (uint) x16[33 + c]           | ((uint) x16[37 + c]           << 16); // qh[2*c..2*c + 1], scales[2*c..2*c + 1]
+    r[3] = as_type<ushort>(xb->d);
+}
+
+void mm_wc_dq2_dec(device const block_iq2_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    const float d = (float) as_type<half>((ushort) r[3]);
+
+    const uint q = r[0] >> (8*(aks%2));
+    const uint s = r[1] >> (8*(aks%2));
+
+    FOR_UNROLL (int h = 0; h < 2; h++) {
+        const float dl = d*(0.5f + (float) ((r[2] >> (16 + 8*h + 4*(aks/2))) & 0xF))*0.25f;
+        const uint2 g  = ((constant uint2 *) iq2s_grid)[((q >> 16*h) & 0xFF) | (((r[2] >> (8*h + 2*aks)) & 3) << 8)];
+
+        v[2*h + 0] = dl*float4(as_type<uchar4>(g.x));
+        v[2*h + 1] = dl*float4(as_type<uchar4>(g.y));
+    }
+    sg = (s & 0xFF) | ((s >> 8) & 0xFF00);
+}
+
 // k row in the chunk of the staged A word wa[i]
 static inline int mm_wc_ka(bool dq2, int aks, int i) {
     return dq2 ? (i < 8 ? 8*aks + i : 24 + 8*aks + i) : 16*aks + i;
@@ -837,13 +1025,34 @@ kernel void kernel_mul_mm_wc(
         }
     }
 
+    // dq2 split loaders (all dq2 types but q3_K and q4_K) with the row pointers out of the loop
+    // QK_K blocks, K % 256 == 0, so every chunk is whole. rows past M read row M - 1 (their outputs are not stored)
+    constexpr bool dq2_sp = !is_same<block_q, block_q3_K>::value && !is_same<block_q, block_q4_K>::value;
+    device const block_q * xr0 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp,      M - 1));
+    device const block_q * xr1 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp + 64, M - 1));
+
     for (int k0 = kb0; k0 < kb1; k0 += BK) {
         if (!FC_mul_mm_wc_early && k0 > kb0) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         uint wa[16];
-        if (FC_mul_mm_wc_dq2) {
+        if (FC_mul_mm_wc_dq2 && dq2_sp) {
+            uint r0[MM_WC_DQ2_NR];
+            uint r1[MM_WC_DQ2_NR];
+            mm_wc_dq2_load(xr0 + k0/QK_K, (k0/64) % 4, aks, r0);
+            mm_wc_dq2_load(xr1 + k0/QK_K, (k0/64) % 4, aks, r1);
+            float4 v0[4];
+            float4 v1[4];
+            uint sg0;
+            uint sg1;
+            mm_wc_dq2_dec(xr0, r0, (k0/64) % 4, aks, v0, sg0);
+            mm_wc_dq2_dec(xr1, r1, (k0/64) % 4, aks, v1, sg1);
+            const uint sg = sg0 | (sg1 << 16);
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                wa[i] = as_type<uint>(half2((half) v0[i/4][i%4], (half) v1[i/4][i%4])) ^ ((sg << (15 - i)) & 0x80008000u);
+            }
+        } else if (FC_mul_mm_wc_dq2) {
             // K-quants: K % 256 == 0, so every chunk is whole. rows past M read row M - 1 (their outputs are not stored)
             device const block_q * x0 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp,      M - 1)) + k0/QK_K;
             device const block_q * x1 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp + 64, M - 1)) + k0/QK_K;
