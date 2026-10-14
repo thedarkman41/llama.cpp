@@ -2349,6 +2349,50 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         return;
     }
 
+    // small copies (e.g. the graph inputs of every decode step) are queued without waiting for them:
+    // the data is first copied into a new shared buffer, so the caller may reuse its memory right away,
+    // and the command buffer keeps both buffers alive. later work on the device queue (graphs, events,
+    // get_tensor, memset_tensor) is ordered after the copy; ggml_metal_synchronize does not wait for it.
+    // above ~128 KiB allocating and filling the staging buffer costs more than waiting for the blit.
+    // GGML_METAL_SET_TENSOR_SYNC=1 always waits
+    static int sync_only = -1;
+    if (sync_only < 0) {
+        sync_only = getenv("GGML_METAL_SET_TENSOR_SYNC") ? atoi(getenv("GGML_METAL_SET_TENSOR_SYNC")) != 0 : 0;
+    }
+
+    if (!sync_only && size <= 128*1024) {
+        @autoreleasepool {
+            struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+            if (bid_dst.metal == nil) {
+                GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+            }
+            bid_dst.offs += offset;
+
+            id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data
+                                                                      length:size
+                                                                     options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_src);
+
+            id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBuffer];
+
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+            [encoder copyFromBuffer:buf_src
+                       sourceOffset:0
+                           toBuffer:bid_dst.metal
+                  destinationOffset:bid_dst.offs
+                               size:size];
+
+            [encoder endEncoding];
+
+            [cmd_buf commit];
+
+            [buf_src release];
+        }
+
+        return;
+    }
+
     @autoreleasepool {
         // src
         void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
