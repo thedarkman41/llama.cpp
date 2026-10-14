@@ -1292,13 +1292,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q3_K:
             {
+                v2  = use_v2(5);
                 nsg = N_SG_Q3_K;
                 nr0 = N_R0_Q3_K;
+                if (v2) {
+                    // v2 takes nr0 from FC_mul_mv_nr0: fewer rows per simdgroup for small matrices so that more threadgroups run
+                    nr0 = ne01 >= 2048 ? N_R0_Q3_K_V2 : ne01 > 512 ? 2 : 1;
+                }
             } break;
         case GGML_TYPE_Q4_K:
             {
+                v2  = use_v2(6);
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+                if (v2) {
+                    // v2 takes nr0 from FC_mul_mv_nr0
+                    nr0 = ne01 > 1024 ? N_R0_Q4_K_V2 : 1;
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {
@@ -1427,7 +1437,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d_v2=%d", base, nsg, ne12, r2, r3, split, tgg, v2);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d_v2=%d_nr0=%d", base, nsg, ne12, r2, r3, split, tgg, v2, nr0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1440,6 +1450,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, tgg,            FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, v2,             FC_MUL_MV + 7);
+        ggml_metal_cv_set_int16(cv, nr0,            FC_MUL_MV + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

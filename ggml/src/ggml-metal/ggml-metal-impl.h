@@ -102,6 +102,8 @@
 // v2 mat-vec bodies on GPUs without simdgroup-mm (FC_mul_mv_v2)
 #define N_R0_IQ4_XS_V2 4
 #define N_R0_Q5_K_V2   2
+#define N_R0_Q3_K_V2   4 // for ne01 >= 2048, see ggml_metal_library_get_pipeline_mul_mv
+#define N_R0_Q4_K_V2   2 // for ne01 > 1024
 
 #define N_R0_TQ2_0 4
 #define N_SG_TQ2_0 2

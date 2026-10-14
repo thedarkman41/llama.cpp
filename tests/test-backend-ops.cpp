@@ -10749,7 +10749,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Metal v2 mat-vec bodies (GGML_METAL_MV_V2): n = 1 with split (k < 1024) and non-split k, odd m, odd superblock count, broadcast
     for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1000, 1024}, {1001, 5120}, {37, 2560}, {63, 1280}, {4100, 512}, {17, 256},
-                                                                    {1002, 2048}, {5, 512}, {3, 256}, {29, 768}}) {
+                                                                    {1002, 2048}, {5, 512}, {7, 256}, {29, 768}}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 1, 1024, {3, 2}, {2, 1}));
@@ -10760,6 +10760,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 2048, 1, 512));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 1001, 1, 2048)); // row tail
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false,   37, 1, 512));
+    }
+    // Metal v2 q3_K / q4_K mat-vec: every nr0 (q3_K 1, 2, 4; q4_K 1, 2), odd m for the row tail, odd superblock count, broadcast
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
+        for (int64_t m : {5, 29, 37, 512, 513, 1001, 1002, 2047, 2049, 2051, 4100}) { // not m = 3: with 3 outputs the CPU's q8_K rounding of y alone exceeds the NMSE bound ~1% of the time
+            for (int64_t k : {256, 768, 2048, 5120}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   64, 1, 1024, {3, 2}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2050, 1,  768, {3, 2}, {2, 1}));
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
@@ -12323,6 +12333,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // output head
+    // qwen3.8-27B Q3_K_M decode shapes
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 6144}, {6144, 5120}, {12288, 5120}, {1024, 5120}, {48, 5120}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{5120, 17408}, {10240, 5120}, {5120, 6144}, {1024, 5120}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
     for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 1, 2048));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
