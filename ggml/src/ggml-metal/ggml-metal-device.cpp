@@ -2020,6 +2020,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe_nd(
+        ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm, bool minmax) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_topk_moe_f32_nd");
+    snprintf(name, 256, "%s_n_expert=%d_top_k=%d_with_norm=%d_minmax=%d", base, n_expert, top_k, with_norm ? 1 : 0, minmax ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool (cv, with_norm, FC_TOPK_MOE + 0);
+        ggml_metal_cv_set_int32(cv, n_expert,  FC_TOPK_MOE + 1);
+        ggml_metal_cv_set_int32(cv, top_k,     FC_TOPK_MOE + 2);
+        ggml_metal_cv_set_bool (cv, minmax,    FC_TOPK_MOE + 3);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce(ggml_metal_library_t lib, int32_t n_expert_used) {
     char base[256];
     char name[256];

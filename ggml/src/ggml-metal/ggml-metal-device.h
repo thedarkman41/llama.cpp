@@ -163,6 +163,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k    
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix       (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe          (ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe_nd       (ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm, bool minmax);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce        (ggml_metal_library_t lib, int32_t n_expert_used);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin               (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
@@ -323,6 +324,8 @@ struct ggml_metal_device_props {
 
     int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
     int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)
+
+    int topk_moe;   // GGML_METAL_TOPK_MOE: 0 = kernel_topk_moe_f32, 1 = kernel_topk_moe_f32_nd, 2 = _nd with simd_max/simd_min select (default without simdgroup-mm)
 
     int gdn_rb;     // GGML_METAL_GDN_RB: 1 = register-blocked GATED_DELTA_NET (default on GPUs without simdgroup-mm), 0 = off
     int gdn_rb_min; // GGML_METAL_GDN_RB_MIN: least tokens per sequence for the rb kernel (default 2: decode keeps the old kernel)

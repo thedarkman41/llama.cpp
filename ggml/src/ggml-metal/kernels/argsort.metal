@@ -3,6 +3,7 @@
 constant bool FC_topk_moe_with_norm [[function_constant(FC_TOPK_MOE + 0)]];
 constant int  FC_topk_moe_n_expert  [[function_constant(FC_TOPK_MOE + 1)]];
 constant int  FC_topk_moe_top_k     [[function_constant(FC_TOPK_MOE + 2)]];
+constant bool FC_topk_moe_minmax    [[function_constant(FC_TOPK_MOE + 3)]];
 
 constant int  FC_moe_reduce_n_expert_used [[function_constant(FC_MOE_REDUCE + 0)]];
 
@@ -448,6 +449,161 @@ kernel void kernel_topk_moe_f32(
         const int idx = i * 32 + lane;
         if (idx < top_k) {
             weights_row[idx] = output_weights[i] * args.scale;
+        }
+    }
+}
+
+// register-only variant of kernel_topk_moe_f32 for GPUs without simdgroup-mm.
+// Same arithmetic, same order of operations and the same tie-breaking as kernel_topk_moe_f32: the ids
+// match exactly. With with_norm, a scale that is not a power of two and n_expert <= 32 the weights can
+// differ by 1-2 ulp, because the compiled kernel_topk_moe_f32 applies the scale before the norm; this
+// kernel keeps the source order, (w*inv)*scale: normalize, then scale, like the unfused CPU graph.
+// Every per-thread array is indexed only by compile-time constants (each loop runs to the
+// 32-slot capacity and is guarded by the FC-derived bound), so the arrays become scalars
+// in the front end and nothing is spilled to scratch. The data-dependent knockout
+// wt[best_expert / 32] and the store output_weights[k / 32] become unrolled compare/selects.
+// One simdgroup handles one token row; a threadgroup holds ntg.x/32 rows.
+// FC_topk_moe_minmax selects the global winner with simd_max + simd_min instead of the
+// pair butterfly (same result: local best values are never NaN and lanes own disjoint experts).
+kernel void kernel_topk_moe_f32_nd(
+        constant   ggml_metal_kargs_topk_moe & args,
+        device const char * src0,
+        device       float * weights,
+        device      int32_t * ids,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    // int locals only (short-typed index locals miscompile on the AMD Metal compiler)
+    const int nsg = (int) ntg.x / 32;
+    const int row = (int) tgpig.x * nsg + (int) sgitg;
+    if (row >= args.ne01) {
+        return;
+    }
+
+    const int n_expert   = FC_topk_moe_n_expert;
+    const int top_k      = FC_topk_moe_top_k;
+    const int lane       = (int) tiisg;
+    const int n_per_lane = (n_expert + 31) / 32; // <= 32 (host limit 1024)
+    const int n_out_lane = (top_k    + 31) / 32; // <= 32
+
+    device const float * logits_row  = (device const float *) (src0 + row * args.nb01);
+    device       float * weights_row = weights + row * top_k;
+    device     int32_t * ids_row     = ids + row * (args.nb1_ids / sizeof(int32_t));
+
+    float wt[32];
+    float ow[32];
+
+    // same (lane, slot) coverage as: for (i = lane; i < n_expert; i += 32) wt[i/32] = ...
+    FOR_UNROLL (int i = 0; i < 32; ++i) {
+        wt[i] = -INFINITY;
+        ow[i] = 0.0f;
+        if (i < n_per_lane) {
+            const int e = lane + i * 32;
+            if (e < n_expert) {
+                const float v = logits_row[e];
+                wt[i] = isnan(v) ? -FLT_MAX : v;
+            }
+        }
+    }
+
+    // softmax over the expert logits (identical sequence to kernel_topk_moe_f32)
+    float max_val = -INFINITY;
+    FOR_UNROLL (int i = 0; i < 32; ++i) {
+        if (i < n_per_lane) {
+            max_val = max(max_val, wt[i]);
+        }
+    }
+    max_val = simd_max(max_val);
+
+    float sum_val = 0.0f;
+    FOR_UNROLL (int i = 0; i < 32; ++i) {
+        if (i < n_per_lane) {
+            wt[i] = exp(wt[i] - max_val);
+            sum_val += wt[i];
+        }
+    }
+    sum_val = simd_sum(sum_val);
+
+    const float inv_sum = 1.0f / sum_val;
+    FOR_UNROLL (int i = 0; i < 32; ++i) {
+        if (i < n_per_lane) {
+            wt[i] *= inv_sum;
+        }
+    }
+
+    float wt_sum = 0.0f;
+
+    for (int k = 0; k < top_k; ++k) {
+        float best_val    = -INFINITY;
+        int   best_expert = -1;
+
+        FOR_UNROLL (int i = 0; i < 32; ++i) {
+            if (i < n_per_lane) {
+                const int expert = lane + i * 32;
+                if (expert < n_expert && (wt[i] > best_val || (wt[i] == best_val && expert < best_expert))) {
+                    best_val    = wt[i];
+                    best_expert = expert;
+                }
+            }
+        }
+
+        if (FC_topk_moe_minmax) {
+            const float gmax = simd_max(best_val);
+            best_expert = simd_min(best_val == gmax ? best_expert : 0x7fffffff);
+            best_val    = gmax;
+        } else {
+            FOR_UNROLL (int mask = 16; mask > 0; mask >>= 1) {
+                const float val    = simd_shuffle_xor(best_val, mask);
+                const int   expert = simd_shuffle_xor(best_expert, mask);
+                if (val > best_val || (val == best_val && expert < best_expert)) {
+                    best_val    = val;
+                    best_expert = expert;
+                }
+            }
+        }
+
+        // == "if ((best_expert & 31) == lane) wt[best_expert / 32] = -INFINITY;" (incl. best_expert == -1)
+        const int kl = best_expert & 31;
+        const int ki = best_expert / 32;
+        FOR_UNROLL (int i = 0; i < 32; ++i) {
+            if (i < n_per_lane && kl == lane && ki == i) {
+                wt[i] = -INFINITY;
+            }
+        }
+
+        // == "if ((k & 31) == lane) output_weights[k / 32] = best_val;"
+        FOR_UNROLL (int j = 0; j < 32; ++j) {
+            if (j < n_out_lane && (k & 31) == lane && (k >> 5) == j) {
+                ow[j] = best_val;
+            }
+        }
+
+        if (kl == lane) {
+            ids_row[k] = best_expert;
+            if (FC_topk_moe_with_norm) {
+                wt_sum += best_val;
+            }
+        }
+    }
+
+    if (FC_topk_moe_with_norm) {
+        wt_sum = simd_sum(wt_sum);
+        wt_sum = max(wt_sum, args.clamp);
+        const float inv = 1.0f / wt_sum;
+        FOR_UNROLL (int j = 0; j < 32; ++j) {
+            if (j < n_out_lane) {
+                ow[j] *= inv;
+            }
+        }
+    }
+
+    FOR_UNROLL (int j = 0; j < 32; ++j) {
+        if (j < n_out_lane) {
+            const int idx = j * 32 + lane;
+            if (idx < top_k) {
+                weights_row[idx] = ow[j] * args.scale;
+            }
         }
     }
 }

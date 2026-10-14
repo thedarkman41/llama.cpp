@@ -6425,15 +6425,33 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
         /*.scale =*/ scale,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm);
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits),  1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),     3);
+    if (props_dev->topk_moe > 0) {
+        // register-only router kernel: one simdgroup per token, nsg tokens per threadgroup
+        auto pipeline = ggml_metal_library_get_pipeline_topk_moe_nd(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm,
+                props_dev->topk_moe == 2);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) n_tokens, 1, 1, 32, 1, 1);
+        const int nsg = n_tokens >= 64 ? std::max(1, std::min(4, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/32)) : 1;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits),  1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),     3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) ((n_tokens + nsg - 1)/nsg), 1, 1, 32*nsg, 1, 1);
+    } else {
+        auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits),  1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),     3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) n_tokens, 1, 1, 32, 1, 1);
+    }
 
     ctx->count_fusions(fusion);
 

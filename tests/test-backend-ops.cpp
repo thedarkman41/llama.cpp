@@ -7371,6 +7371,7 @@ struct test_topk_moe : public test_case {
         const int n_tokens = ne[1];
 
         ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(logits, "logits");
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) :
@@ -7414,6 +7415,29 @@ struct test_topk_moe : public test_case {
         ggml_set_name(weights, "weights");
         return weights;
     }
+
+    // distinct logits in each row (evenly spaced in [-1, 1], shuffled): random near-ties at the top-k
+    // boundary would let backends pick different experts within rounding
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "logits") == 0) {
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        data[i] = n > 1 ? -1.0f + 2.0f*i/(n - 1) : 0.0f;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], n * sizeof(float));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
@@ -11930,9 +11954,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({32, 9, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({256,   1, 1, 1},  8, with_norm, bias_probs, gate, scale_w)); // qwen35moe decode
+                    test_cases.emplace_back(new test_topk_moe({256,  22, 1, 1},  8, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({256, 130, 1, 1},  8, with_norm, bias_probs, gate, scale_w)); // 4 rows per threadgroup, partial last one
+                    test_cases.emplace_back(new test_topk_moe({1024,  5, 1, 1}, 40, with_norm, bias_probs, gate, scale_w)); // 32 slots per lane, 2 outputs per lane
                 }
             }
         }
+    }
+    // fused router (softmax gate, no bias) with the most registers per lane and 4 rows per threadgroup
+    for (bool with_norm : {false, true}) {
+        for (float scale_w : {0.0f, 2.5f}) {
+            test_cases.emplace_back(new test_topk_moe({1024, 130, 1, 1}, 64, with_norm, false, GATING_FUNC_SOFTMAX, scale_w));
+        }
+    }
+    // norm with a scale that is not a power of two
+    for (float scale_w : {2.5f, 0.3f}) {
+        test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, scale_w));
+        test_cases.emplace_back(new test_topk_moe({71,  22, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, scale_w));
+        test_cases.emplace_back(new test_topk_moe({32,  22, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, scale_w));
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.

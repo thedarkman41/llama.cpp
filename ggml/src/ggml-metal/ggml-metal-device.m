@@ -1297,6 +1297,13 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MOE_WL=%d GGML_METAL_MOE_WL_MIN=%d\n", __func__, dev->props.moe_wl, dev->props.moe_wl_min);
                 }
 
+                // fused MoE router: register-only kernel with the simd_max/simd_min select on GPUs without simdgroup-mm
+                dev->props.topk_moe = getenv("GGML_METAL_TOPK_MOE") ? atoi(getenv("GGML_METAL_TOPK_MOE"))
+                                                                    : (dev->props.has_simdgroup_mm ? 0 : 2);
+                if (getenv("GGML_METAL_TOPK_MOE")) {
+                    GGML_LOG_INFO("%s: GGML_METAL_TOPK_MOE=%d\n", __func__, dev->props.topk_moe);
+                }
+
                 // register-blocked GATED_DELTA_NET: default on GPUs without simdgroup-mm (Apple keeps the old kernel)
                 dev->props.gdn_rb     = getenv("GGML_METAL_GDN_RB")     ? atoi(getenv("GGML_METAL_GDN_RB"))     : (dev->props.has_simdgroup_mm ? 0 : 1);
                 dev->props.gdn_rb_min = getenv("GGML_METAL_GDN_RB_MIN") ? atoi(getenv("GGML_METAL_GDN_RB_MIN")) : 2;
