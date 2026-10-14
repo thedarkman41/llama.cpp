@@ -1145,6 +1145,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     char base[256];
     char name[256];
 
+    // lookup grids in threadgroup memory (FC_mul_mv_tgg) on GPUs without simdgroup-mm
+    const bool tgg = !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm;
+
     int nsg = 0; // number of simdgroups
     int nr0 = 0; // number of src0 rows per simdgroup
     int nr1 = 1; // number of src1 rows per threadgroup
@@ -1297,6 +1300,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ2_S;
                 nr0 = N_R0_IQ2_S;
+                smem = tgg ? 1024*8 : 0; // iq2s_grid
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1355,7 +1359,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d", base, nsg, ne12, r2, r3, split, tgg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1366,6 +1370,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, tgg,            FC_MUL_MV + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1547,6 +1552,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     char base[256];
     char name[256];
 
+    // lookup grids in threadgroup memory (FC_mul_mv_tgg) on GPUs without simdgroup-mm
+    const bool tgg = !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm;
+
     int nsg = 0; // number of simdgroups
     int nr0 = 0; // number of src0 rows per simdgroup
     int nr1 = 1; // number of src1 rows per threadgroup
@@ -1692,6 +1700,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ2_S;
                 nr0 = N_R0_IQ2_S;
+                smem = tgg ? 1024*8 : 0; // iq2s_grid
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1746,7 +1755,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     };
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
+    snprintf(name, 256, "%s_nsg=%d_split=%d_tgg=%d", base, nsg, split, tgg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1757,6 +1766,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split, FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, tgg,   FC_MUL_MV + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

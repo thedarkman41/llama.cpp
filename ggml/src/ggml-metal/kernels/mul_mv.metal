@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant bool  FC_mul_mv_tgg   [[function_constant(FC_MUL_MV + 6)]]; // lookup grids in threadgroup memory
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -2460,13 +2461,15 @@ void kernel_mul_mv_iq2_s_f32_impl(
     float yl[32];
     float sumf[nr0]={0.f};
 
-    //threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
-    //{
-    //    int nval = 32;
-    //    int pos  = (32*sgitg + tiisg)*nval;
-    //    for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2s_grid[pos + i];
-    //    threadgroup_barrier(mem_flags::mem_threadgroup);
-    //}
+    // FC_mul_mv_tgg (GPUs without simdgroup-mm): read the grid from threadgroup memory, data-dependent
+    // reads from constant memory are slow there. smem = 8 KB, set by the pipeline getters
+    threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
+    if (FC_mul_mv_tgg) {
+        for (int i = 32*sgitg + tiisg; i < 1024; i += 32*NSG) {
+            svalues[i] = iq2s_grid[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     device const float * y4 = y + 32 * ix;
 
@@ -2492,13 +2495,22 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
             float2 sum = {0};
             for (short l = 0; l < 2; ++l) {
-                //const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(svalues + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                //const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(svalues + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                for (short j = 0; j < 8; ++j) {
-                    sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
-                    sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+                const int i1 = qs[l+0] | ((qh[0] << (8-2*l)) & 0x300);
+                const int i2 = qs[l+2] | ((qh[0] << (4-2*l)) & 0x300);
+                if (FC_mul_mv_tgg) {
+                    const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(svalues + i1);
+                    const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(svalues + i2);
+                    for (short j = 0; j < 8; ++j) {
+                        sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
+                        sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+                    }
+                } else {
+                    constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + i1);
+                    constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + i2);
+                    for (short j = 0; j < 8; ++j) {
+                        sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
+                        sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+                    }
                 }
             }
             sumf[row] += d1 * sum[0] + d2 * sum[1];
