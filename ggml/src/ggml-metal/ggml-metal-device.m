@@ -1289,6 +1289,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_WC=%d\n", __func__, dev->props.mm_wc);
                 }
 
+                // v2 mat-vec bodies (FC_mul_mv_v2), only used on GPUs without simdgroup-mm
+                dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x1f;
+                if (dev->props.mv_v2 != 0x1f) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MV_V2=0x%x\n", __func__, dev->props.mv_v2);
+                }
+
                 // grouped MoE matmul for prefill: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
                 // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert (and n_tokens >= 32), 0 = any batch (testing)
                 dev->props.moe_wl     = getenv("GGML_METAL_MOE_WL")     ? atoi(getenv("GGML_METAL_MOE_WL"))     : 2;

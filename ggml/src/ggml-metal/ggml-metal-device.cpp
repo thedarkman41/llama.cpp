@@ -1202,8 +1202,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     char base[256];
     char name[256];
 
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
     // lookup grids in threadgroup memory (FC_mul_mv_tgg) on GPUs without simdgroup-mm
-    const bool tgg = !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm;
+    const bool tgg = !props->has_simdgroup_mm;
+
+    // v2 mat-vec bodies (FC_mul_mv_v2) per type, GPUs without simdgroup-mm only
+    bool v2 = false;
+    auto use_v2 = [&](int bit) { return tgg && ((props->mv_v2 >> bit) & 1); };
 
     int nsg = 0; // number of simdgroups
     int nr0 = 0; // number of src0 rows per simdgroup
@@ -1296,8 +1302,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q5_K:
             {
+                v2  = use_v2(4);
                 nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
+                nr0 = v2 ? N_R0_Q5_K_V2 : N_R0_Q5_K;
             } break;
         case GGML_TYPE_Q6_K:
             {
@@ -1330,6 +1337,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ3_XXS:
             {
+                v2  = use_v2(1); // v2 uses the same smem: 256*4 grid + 16*8 sign masks
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
                 smem = 256*4+128;
@@ -1343,9 +1351,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ3_S:
             {
+                v2  = use_v2(0);
                 nsg = N_SG_IQ3_S;
                 nr0 = N_R0_IQ3_S;
-                smem = 512*4;
+                smem = 512*4 + (v2 ? 16*8 : 0);
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1355,9 +1364,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ2_S:
             {
+                v2  = use_v2(2);
                 nsg = N_SG_IQ2_S;
                 nr0 = N_R0_IQ2_S;
-                smem = tgg ? 1024*8 : 0; // iq2s_grid
+                smem = v2 ? 1024*8 + 16*8 : (tgg ? 1024*8 : 0); // iq2s_grid (+ v2 sign masks)
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1395,8 +1405,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ4_XS:
             {
+                v2  = use_v2(3);
                 nsg = N_SG_IQ4_XS;
-                nr0 = N_R0_IQ4_XS;
+                nr0 = v2 ? N_R0_IQ4_XS_V2 : N_R0_IQ4_XS;
                 smem = 32*sizeof(float);
             } break;
         case GGML_TYPE_TQ2_0:
@@ -1416,7 +1427,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d", base, nsg, ne12, r2, r3, split, tgg);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d_v2=%d", base, nsg, ne12, r2, r3, split, tgg, v2);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1428,6 +1439,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, tgg,            FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, v2,             FC_MUL_MV + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1609,8 +1621,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     char base[256];
     char name[256];
 
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
     // lookup grids in threadgroup memory (FC_mul_mv_tgg) on GPUs without simdgroup-mm
-    const bool tgg = !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm;
+    const bool tgg = !props->has_simdgroup_mm;
+
+    // v2 mat-vec bodies (FC_mul_mv_v2) per type, GPUs without simdgroup-mm only
+    bool v2 = false;
+    auto use_v2 = [&](int bit) { return tgg && ((props->mv_v2 >> bit) & 1); };
 
     int nsg = 0; // number of simdgroups
     int nr0 = 0; // number of src0 rows per simdgroup
@@ -1730,6 +1748,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ3_XXS:
             {
+                v2  = use_v2(1); // v2 uses the same smem: 256*4 grid + 16*8 sign masks
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
                 smem = 256*4+128;
@@ -1743,9 +1762,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ3_S:
             {
+                v2  = use_v2(0);
                 nsg = N_SG_IQ3_S;
                 nr0 = N_R0_IQ3_S;
-                smem = 512*4;
+                smem = 512*4 + (v2 ? 16*8 : 0);
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1755,9 +1775,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ2_S:
             {
+                v2  = use_v2(2);
                 nsg = N_SG_IQ2_S;
                 nr0 = N_R0_IQ2_S;
-                smem = tgg ? 1024*8 : 0; // iq2s_grid
+                smem = v2 ? 1024*8 + 16*8 : (tgg ? 1024*8 : 0); // iq2s_grid (+ v2 sign masks)
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
@@ -1795,8 +1816,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ4_XS:
             {
+                v2  = use_v2(3);
                 nsg = N_SG_IQ4_XS;
-                nr0 = N_R0_IQ4_XS;
+                nr0 = v2 ? N_R0_IQ4_XS_V2 : N_R0_IQ4_XS;
                 smem = 32*sizeof(float);
             } break;
         case GGML_TYPE_TQ2_0:
@@ -1812,7 +1834,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     };
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_split=%d_tgg=%d", base, nsg, split, tgg);
+    snprintf(name, 256, "%s_nsg=%d_split=%d_tgg=%d_v2=%d", base, nsg, split, tgg, v2);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1824,6 +1846,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split, FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, tgg,   FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, v2,    FC_MUL_MV + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
