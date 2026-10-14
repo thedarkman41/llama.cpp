@@ -212,6 +212,61 @@ template [[host_name("kernel_concat_i16")]]  kernel kernel_concat_t kernel_conca
 template [[host_name("kernel_concat_i32")]]  kernel kernel_concat_t kernel_concat<int>;
 template [[host_name("kernel_concat_i64")]]  kernel kernel_concat_t kernel_concat<long>;
 
+// dim-0 concat through a 32x32 threadgroup tile: loads walk dim 1 and stores walk dim 0, so both
+// sides are coalesced when a source is a transposed view (nb[0] > nb[1])
+// threadgroup: 32x8, grid: (ceil(ne0/32), ceil(ne1/32), ne2*ne3)
+template<typename T>
+kernel void kernel_concat_tr(
+        constant ggml_metal_kargs_concat & args,
+        device  const char * src0,
+        device  const char * src1,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float tile[32*33]; // odd pitch: conflict-free row and column access
+
+    const int i3 = tgpig.z/args.ne2;
+    const int i2 = tgpig.z%args.ne2;
+
+    const int i0b = tgpig.x*32;
+    const int i1b = tgpig.y*32;
+
+    {
+        const int i1 = i1b + tpitg.x;
+
+        for (int k = tpitg.y; k < 32; k += 8) {
+            const int i0 = i0b + k;
+
+            if (i0 < args.ne0 && i1 < args.ne1) {
+                device const T * x = i0 < args.ne00
+                    ? (device const T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + (i0            )*args.nb00)
+                    : (device const T *)(src1 + i3*args.nb13 + i2*args.nb12 + i1*args.nb11 + (i0 - args.ne00)*args.nb10);
+
+                tile[k*33 + tpitg.x] = (float) *x;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        const int i0 = i0b + tpitg.x;
+
+        for (int k = tpitg.y; k < 32; k += 8) {
+            const int i1 = i1b + k;
+
+            if (i0 < args.ne0 && i1 < args.ne1) {
+                *(device T *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0) = (T) tile[tpitg.x*33 + k];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_concat_tr<float>) kernel_concat_tr_t;
+
+template [[host_name("kernel_concat_tr_f32")]] kernel kernel_concat_tr_t kernel_concat_tr<float>;
+template [[host_name("kernel_concat_tr_f16")]] kernel kernel_concat_tr_t kernel_concat_tr<half>;
+
 template<typename block_q>
 kernel void kernel_concat_q(
         constant ggml_metal_kargs_concat & args,
