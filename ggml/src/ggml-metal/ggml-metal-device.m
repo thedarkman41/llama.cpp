@@ -1297,6 +1297,15 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MOE_WL=%d GGML_METAL_MOE_WL_MIN=%d\n", __func__, dev->props.moe_wl, dev->props.moe_wl_min);
                 }
 
+                // register-blocked GATED_DELTA_NET: default on GPUs without simdgroup-mm (Apple keeps the old kernel)
+                dev->props.gdn_rb     = getenv("GGML_METAL_GDN_RB")     ? atoi(getenv("GGML_METAL_GDN_RB"))     : (dev->props.has_simdgroup_mm ? 0 : 1);
+                dev->props.gdn_rb_min = getenv("GGML_METAL_GDN_RB_MIN") ? atoi(getenv("GGML_METAL_GDN_RB_MIN")) : 2;
+                dev->props.gdn_rb_cfg = getenv("GGML_METAL_GDN_RB_CFG") ? atoi(getenv("GGML_METAL_GDN_RB_CFG")) : 0;
+                if (getenv("GGML_METAL_GDN_RB") || getenv("GGML_METAL_GDN_RB_MIN") || getenv("GGML_METAL_GDN_RB_CFG")) {
+                    GGML_LOG_INFO("%s: GGML_METAL_GDN_RB=%d GGML_METAL_GDN_RB_MIN=%d GGML_METAL_GDN_RB_CFG=%d\n", __func__,
+                            dev->props.gdn_rb, dev->props.gdn_rb_min, dev->props.gdn_rb_cfg);
+                }
+
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {

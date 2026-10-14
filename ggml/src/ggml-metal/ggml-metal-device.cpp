@@ -793,6 +793,51 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_rb(ggml_metal_library_t lib, const ggml_tensor * op, int lpr, int rpl) {
+    char base[256];
+    char name[256];
+
+    const int ne20 = op->src[2]->ne[0]; // S_v
+    const int ne21 = op->src[2]->ne[1]; // H
+    const int ne30 = op->src[3]->ne[0]; // G (1 or S_v)
+    const int K    = ggml_get_op_params_i32(op, 0);
+
+    GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->ne[0] == ne20 * ne21);
+    GGML_ASSERT(ne20 == 32 || ne20 == 64 || ne20 == 128);
+    GGML_ASSERT(ne30 == 1 || ne30 == ne20);
+    GGML_ASSERT((lpr == 8 && (rpl == 1 || rpl == 2)) || (lpr == 4 && rpl == 2));
+
+    const int rows = (32/lpr)*rpl; // state rows per threadgroup (one simdgroup)
+    GGML_ASSERT(ne20 % rows == 0);
+
+    snprintf(base, 256, "kernel_gated_delta_net_rb_%s_%d_%d_%d", ggml_type_name(op->src[0]->type), ne20, lpr, rpl);
+    snprintf(name, 256, "%s_ne30=%d_K=%d", base, ne30, K);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        // FC ne20 is not referenced by the rb kernel (S_v is a template parameter)
+        ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
+        ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+
+        GGML_ASSERT(res.pipeline && ggml_metal_pipeline_max_theads_per_threadgroup(res) >= 32);
+
+        GGML_LOG_INFO("%s: using %s\n", __func__, name);
+    }
+
+    res.nsg  = 1;
+    res.nr0  = rows;
+    res.smem = 2*(ne30 == 1 ? 2 : 3)*(size_t) ne20*sizeof(float); // double-buffered [k | q | exp(g)]
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];

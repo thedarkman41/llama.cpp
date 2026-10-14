@@ -1984,6 +1984,72 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// register-blocked GATED_DELTA_NET (kernel_gated_delta_net_rb_*) on GPUs without simdgroup-mm: several lanes
+// per state row and several rows per lane, one reduction butterfly per token. false keeps the old kernel
+static bool ggml_metal_op_gdn_rb_select(const ggml_tensor * op, const ggml_metal_device_props * props,
+        ggml_metal_buffer_id bid_out, uint64_t nb_out, int * lpr, int * rpl) {
+    if (props->gdn_rb <= 0) {
+        return false;
+    }
+
+    const int64_t S_v = op->src[2]->ne[0];
+    const int64_t H   = op->src[2]->ne[1];
+    const int64_t T   = op->src[2]->ne[2];
+    const int64_t B   = op->src[2]->ne[3];
+    const int64_t G   = op->src[3]->ne[0];
+    const int     K   = ggml_get_op_params_i32(op, 0);
+
+    const int t_min = props->gdn_rb_min > 1 ? props->gdn_rb_min : 1;
+
+    if ((S_v != 32 && S_v != 64 && S_v != 128) || (G != 1 && G != S_v) || T < t_min) {
+        return false;
+    }
+    // q/k rows are read as S_v floats
+    if (op->src[0]->ne[0] != S_v || op->src[1]->ne[0] != S_v) {
+        return false;
+    }
+    for (int i = 0; i <= 5; ++i) {
+        if (op->src[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // dim 0 contiguous (the old kernel assumes this too)
+    if (op->src[0]->nb[0] != sizeof(float) || op->src[1]->nb[0] != sizeof(float) || op->src[2]->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // float4 accesses: q/k base and strides, KDA g base, state in and out bases, snapshot stride (K > 1 only)
+    for (int i = 0; i <= 1; ++i) {
+        const ggml_tensor * t = op->src[i];
+        if (ggml_metal_get_buffer_id(t).offs % 16 || t->nb[1] % 16 || t->nb[2] % 16 || t->nb[3] % 16) {
+            return false;
+        }
+    }
+    if (G > 1 && ggml_metal_get_buffer_id(op->src[3]).offs % 16) {
+        return false;
+    }
+    if (ggml_metal_get_buffer_id(op->src[5]).offs % 16 || bid_out.offs % 16) {
+        return false;
+    }
+    if (K > 1 && nb_out % 4) { // in floats; not used for addressing when K == 1
+        return false;
+    }
+
+    int cfg = props->gdn_rb_cfg;
+    if (cfg == 0) {
+        // simdgroups at LPR = 8, RPL = 2; the thresholds assume ~80 SIMD32 with ~8 resident waves each (40 CUs)
+        const int64_t w82 = H*B*S_v/8;
+        cfg = w82 < 160 ? 81 : (w82 <= 640 ? 82 : 42);
+    }
+    if (cfg != 81 && cfg != 82 && cfg != 42) {
+        cfg = 82;
+    }
+
+    *lpr = cfg/10;
+    *rpl = cfg%10;
+
+    return true;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2001,8 +2067,6 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
-
-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     // when fused with the trailing cache cpy, the snapshots are written straight into the
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
@@ -2028,6 +2092,16 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
             }
         }
     }
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    int rb_lpr = 0;
+    int rb_rpl = 0;
+    const bool use_rb = ggml_metal_op_gdn_rb_select(op, props_dev, bid_out, nb_out, &rb_lpr, &rb_rpl);
+
+    auto pipeline = use_rb
+        ? ggml_metal_library_get_pipeline_gated_delta_net_rb(lib, op, rb_lpr, rb_rpl)
+        : ggml_metal_library_get_pipeline_gated_delta_net   (lib, op);
 
     int ida = 0;
 
@@ -2081,9 +2155,17 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
 
-    const int nsg = pipeline.nsg;
+    if (use_rb) {
+        GGML_ASSERT(pipeline.smem <= props_dev->max_theadgroup_memory_size);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+        // one simdgroup per threadgroup, pipeline.nr0 state rows each
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne20/pipeline.nr0, ne21, ne23, 32, 1, 1);
+    } else {
+        const int nsg = pipeline.nsg;
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    }
 
     return n_fuse;
 }

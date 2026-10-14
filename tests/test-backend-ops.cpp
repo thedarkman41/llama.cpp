@@ -4966,6 +4966,55 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// slow decay (g close to 0), as in real models: the state accumulates over long sequences
+struct test_gated_delta_net_slow_decay : public test_gated_delta_net {
+    const float g_lo;
+
+    test_gated_delta_net_slow_decay(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, int v_repeat, float g_lo)
+        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_seq_tokens, n_seqs, v_repeat), g_lo(g_lo) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",g_lo=" + std::to_string(g_lo);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, g_lo, 0.0f);
+            }
+        }
+    }
+};
+
+// q/k reach the op with non-contiguous dims 1-3 (permuted after the L2 norm; the base case permutes before it)
+struct test_gated_delta_net_strided_qk : public test_gated_delta_net {
+    test_gated_delta_net_strided_qk(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, int v_repeat)
+        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_seq_tokens, n_seqs, v_repeat) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",strided_qk=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+        q = ggml_permute(ctx, ggml_l2_norm(ctx, q, 1e-6f), 0, 2, 1, 3);
+        k = ggml_permute(ctx, ggml_l2_norm(ctx, k, 1e-6f), 0, 2, 1, 3);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11945,6 +11994,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
+    // register-blocked Metal path: model shapes, multi-seq, odd T, T = 2, permuted, KDA, snapshots, slow decay
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2)); // qwen3.6-35B pp512
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // qwen3.8-27B pp512
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  33, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,   2, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  48, 1, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  65, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  16, 2, 1, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net_slow_decay(16, 128, 512, 1, 2, -0.05f));
+    test_cases.emplace_back(new test_gated_delta_net_slow_decay( 4,  64, 200, 2, 1, -1e-3f));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128, 64, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128, 64, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8,  64, 40, 2, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128,  2, 1, 4)); // T < K
+    test_cases.emplace_back(new test_gated_delta_net_strided_qk(4, 128, 7, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net_strided_qk(4,  32, 5, 1, 1));
+    // auto config by H*B*S_v/8: < 160 -> LPR 8 RPL 1, <= 640 -> 8/2, else 4/2
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48,  32, 3, 1)); // 8/2
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 24,  64, 4, 1)); // 8/2
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96,  64, 3, 1)); // 4/2
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2, 1)); // 4/2
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
@@ -12452,6 +12523,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2)); // qwen3.6-35B pp512
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // qwen3.8-27B pp512
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   4, 1, 2)); // short batch
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   1, 1, 2)); // decode
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
