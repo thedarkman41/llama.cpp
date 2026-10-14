@@ -1289,6 +1289,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_WC=%d\n", __func__, dev->props.mm_wc);
                 }
 
+                // grouped MoE matmul for prefill: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
+                // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert (and n_tokens >= 32), 0 = any batch (testing)
+                dev->props.moe_wl     = getenv("GGML_METAL_MOE_WL")     ? atoi(getenv("GGML_METAL_MOE_WL"))     : 2;
+                dev->props.moe_wl_min = getenv("GGML_METAL_MOE_WL_MIN") ? atoi(getenv("GGML_METAL_MOE_WL_MIN")) : 1;
+                if (dev->props.moe_wl != 2 || dev->props.moe_wl_min != 1) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MOE_WL=%d GGML_METAL_MOE_WL_MIN=%d\n", __func__, dev->props.moe_wl, dev->props.moe_wl_min);
+                }
+
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {

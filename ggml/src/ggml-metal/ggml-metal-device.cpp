@@ -1498,6 +1498,48 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_tiled(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl(ggml_metal_library_t lib, int ne02, int ne20) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mm_id_map_wl_ne20_%d", ne20);
+    snprintf(name, 256, "%s_ne02=%d", base, ne02);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // routing ids [ne02][ne20] ushort, then the scan [ne02] uint in the same space
+    const size_t smem_ids  = (size_t) ne02*ne20*sizeof(uint16_t);
+    const size_t smem_scan = (size_t) ne02*sizeof(uint32_t);
+
+    res.smem = GGML_PAD(smem_ids > smem_scan ? smem_ids : smem_scan, 16);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl(ggml_metal_library_t lib, const ggml_tensor * op, int bk) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mm_id_wl_%s_%s_bk%d", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), bk);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // must match kernel_mul_mm_id_wl (mul_mm.metal): 4 simdgroups, As[BK][BM/2] + Bs[BK/2][BN] packed half2 words
+    res.nr0  = N_MM_ID_WL_BM;
+    res.nr1  = N_MM_ID_WL_BN;
+    res.nsg  = 4;
+    res.smem = (size_t) (bk*(N_MM_ID_WL_BM/2) + (bk/2)*N_MM_ID_WL_BN)*sizeof(uint32_t);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

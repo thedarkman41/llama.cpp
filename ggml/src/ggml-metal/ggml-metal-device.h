@@ -149,6 +149,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_tiled   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl  (ggml_metal_library_t lib, int ne02, int ne20);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl      (ggml_metal_library_t lib, const struct ggml_tensor * op, int bk);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -316,6 +318,9 @@ struct ggml_metal_device_props {
     int op_offload_min_batch_size;
 
     int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
+
+    int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
+    int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

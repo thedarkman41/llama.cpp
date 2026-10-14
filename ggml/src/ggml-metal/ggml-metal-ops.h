@@ -42,6 +42,9 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
 
+// work list of kernel_mul_mm_id_wl [1 + max items], always reserved
+size_t ggml_metal_op_mul_mat_id_extra_wl(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 

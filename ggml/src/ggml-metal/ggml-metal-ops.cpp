@@ -3018,6 +3018,111 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     return 8 + N_MM_NPART_AMAX*sizeof(float);
 }
 
+// most work items of kernel_mul_mm_id_wl: sum_e ceil(n_e/BN) <= ceil(n_pairs/BN) + min(n_expert, n_pairs)
+static int64_t ggml_metal_op_mul_mat_id_wl_max_items(const ggml_tensor * op) {
+    const int64_t ne02    = op->src[0]->ne[2];
+    const int64_t n_pairs = op->src[2]->ne[0]*op->src[2]->ne[1];
+
+    return (n_pairs + N_MM_ID_WL_BN - 1)/N_MM_ID_WL_BN + std::min(ne02, n_pairs);
+}
+
+size_t ggml_metal_op_mul_mat_id_extra_wl(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    // item count + items
+    return sizeof(uint32_t)*(1 + ggml_metal_op_mul_mat_id_wl_max_items(op));
+}
+
+// src0 types with a kernel_mul_mm_id_wl instantiation (mul_mm.metal)
+static bool ggml_metal_mm_id_wl_supported(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// n_expert_used values with a kernel_mul_mm_id_map_wl instantiation
+static bool ggml_metal_mm_id_map_wl_supported(int64_t ne20) {
+    switch (ne20) {
+        case 1: case 2: case 4: case 5: case 6: case 8: case 10: case 16: case 22:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int ggml_metal_mm_id_wl_bk(const ggml_metal_device_props * props) {
+    return props->moe_wl == 2 ? 64 : 32;
+}
+
+// grouped MoE matmul (kernel_mul_mm_id_wl) for prefill batches on GPUs without simdgroup-mm or tensor API
+static bool ggml_metal_op_mul_mat_id_use_wl(const ggml_tensor * op, const ggml_metal_device_props * props, uint64_t offs_src1) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * src2 = op->src[2];
+
+    if (props->moe_wl <= 0 || props->has_simdgroup_mm || props->has_tensor) {
+        return false;
+    }
+
+    if (!ggml_metal_mm_id_wl_supported(src0->type) || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // the B tile is half: src1 beyond the f16 range stays on mul_mv_id
+    if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+        return false;
+    }
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne20 = src2->ne[0];
+    const int64_t ne21 = src2->ne[1];
+
+    if (ne00 % ggml_metal_mm_id_wl_bk(props) != 0 || !ggml_metal_mm_id_map_wl_supported(ne20) || ne02 > 1024 || ne21 == 0) {
+        return false;
+    }
+
+    // float4 loads of src1 rows, int32 rows of ids, float4 stores of dst rows
+    if (src1->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 || src1->nb[2] % 16 != 0 || offs_src1 % 16 != 0 ||
+        src2->nb[0] != sizeof(int32_t) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    // work item = (expert << 16) | token block, one grid row per item
+    if (ggml_metal_op_mul_mat_id_wl_max_items(op) > 65535) {
+        return false;
+    }
+
+    // mul_mv_id wins when the experts get few tokens each; moe_wl_min <= 0 takes any batch (testing)
+    if (props->moe_wl_min > 0 && (ne21 < 32 || ne21*ne20 < (int64_t) props->moe_wl_min*ne02)) {
+        return false;
+    }
+
+    return true;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3051,6 +3156,94 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
+
+    if (ggml_metal_op_mul_mat_id_use_wl(op, props_dev, bid_src1.offs)) {
+        auto pipeline_map = ggml_metal_library_get_pipeline_mul_mm_id_map_wl(lib, ne02, ne20);
+        auto pipeline_mm  = ggml_metal_library_get_pipeline_mul_mm_id_wl    (lib, op, ggml_metal_mm_id_wl_bk(props_dev));
+
+        // missing kernel, more experts than threads, too much shared memory or a register blow-up: keep mul_mv_id
+        const bool ok = pipeline_map.pipeline && pipeline_mm.pipeline &&
+            ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_map) &&
+            pipeline_map.smem <= props_dev->max_theadgroup_memory_size &&
+            32*pipeline_mm.nsg <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_mm);
+
+        if (ok) {
+            ggml_metal_buffer_id bid_tpe = bid_dst;
+            bid_tpe.offs += ggml_nbytes(op);
+
+            ggml_metal_buffer_id bid_ids = bid_tpe;
+            bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
+
+            // the work list follows the amax slot (unused here)
+            ggml_metal_buffer_id bid_wl = bid_ids;
+            bid_wl.offs += ggml_metal_op_mul_mat_id_extra_ids(op) + ggml_metal_op_mul_mat_id_extra_amax(op);
+
+            {
+                ggml_metal_kargs_mul_mm_id_map0 args = {
+                    ne02,
+                    ne10,
+                    ne11, // n_expert_used (bcast)
+                    nb11,
+                    nb12,
+                    ne21, // n_tokens
+                    ne20, // n_expert_used
+                    nb21,
+                };
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_map);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_tpe,  2);
+                ggml_metal_encoder_set_buffer  (enc, bid_ids,  3);
+                ggml_metal_encoder_set_buffer  (enc, bid_wl,   4);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_map.smem, 0);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            }
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            {
+                ggml_metal_kargs_mul_mm_id args = {
+                    /*.ne00  =*/ ne00,
+                    /*.ne02  =*/ ne02,
+                    /*.nb01  =*/ nb01,
+                    /*.nb02  =*/ nb02,
+                    /*.nb03  =*/ nb03,
+                    /*.ne11  =*/ ne11, // n_expert_used (bcast)
+                    /*.nb10  =*/ nb10,
+                    /*.nb11  =*/ nb11,
+                    /*.nb12  =*/ nb12,
+                    /*.nb13  =*/ nb13,
+                    /*.ne20  =*/ ne20, // n_expert_used
+                    /*.ne21  =*/ ne21, // n_tokens
+                    /*.ne0   =*/ ne0,
+                    /*.ne1   =*/ ne1,
+                    /*.r2    =*/ r2,
+                    /*.r3    =*/ r3,
+                };
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_mm);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
+                ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
+                ggml_metal_encoder_set_buffer  (enc, bid_wl,   5);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_mm.smem, 0);
+
+                // x = row blocks (fastest): the row blocks of a work item read the same tokens; idle items exit at once
+                const int n_items = (int) ggml_metal_op_mul_mat_id_wl_max_items(op);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline_mm.nr0 - 1)/pipeline_mm.nr0, n_items, 1, 32*pipeline_mm.nsg, 1, 1);
+            }
+
+            return 1;
+        }
+    }
 
     // NOTE: the tiled MoE path is correct now (kernel_mul_mm_id_tiled index locals are
     // int, not short - short miscompiled the src1 address for token-tiles >= 2*BN), but

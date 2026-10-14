@@ -10893,6 +10893,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // as is a view whose experts are strided by more rows than it uses
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 1.0f, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 1.0f, 64));
+    // grouped MoE matmul: many token blocks per expert with a partial last one, a single 1-token block,
+    // and a realistic routing (256 experts, 8 used, 512 tokens) that takes the default path
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,  GGML_TYPE_F32,   2, 1, false, 128, 1000,  256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,  GGML_TYPE_F32,   1, 1, false, 128,   33,  256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 256, 8, true,   64,  512, 2048));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));

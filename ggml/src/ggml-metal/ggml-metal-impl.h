@@ -16,6 +16,9 @@
 
 #define N_MM_NPART_AMAX 256
 
+#define N_MM_ID_WL_BM 128 // rows per threadgroup of kernel_mul_mm_id_wl
+#define N_MM_ID_WL_BN 32  // tokens per work item of kernel_mul_mm_id_wl
+
 // kernel parameters for mat-vec threadgroups
 //
 // N_R0: number of src0 rows to process per simdgroup
