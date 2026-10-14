@@ -2678,6 +2678,64 @@ static bool ggml_metal_tiled_mm_supported(enum ggml_type t) {
     }
 }
 
+// rows (and columns) per threadgroup of kernel_mul_mm_wc / kernel_mul_mm_tiled
+#define GGML_METAL_TILED_MM_BM 128
+
+// the scalar tiled GEMM (GPUs with neither simdgroup-mm nor the tensor API) for N > 8 (smaller batches use
+// the mat-vec kernels). with M < BM the mat-vec kernels win only for little work: their cost grows with
+// M*N*K*batch, while the tiled grid (with split-K for few tiles) takes ~120-200 us up to M = BM. take the
+// tiled path for M >= BM or M*N*K*batch >= 2^25 multiply-adds (M = 1, N = 512, K = 2048: mat-vec 24 us vs
+// tiled 360 us; M = 64, N = 512, K = 4096: mat-vec 476 us vs tiled 211 us)
+static bool ggml_metal_op_mul_mat_use_tiled(const ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor) {
+    const int64_t mnkb = op->src[0]->ne[1]*op->src[1]->ne[1]*op->src[0]->ne[0]*op->src[1]->ne[2]*op->src[1]->ne[3];
+
+    return !has_simdgroup_mm && !has_tensor &&
+        op->src[1]->ne[1] > 8 &&
+        (op->src[0]->ne[1] >= GGML_METAL_TILED_MM_BM || mnkb >= ((int64_t) 1 << 25)) &&
+        !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
+        ggml_metal_tiled_mm_supported(op->src[0]->type) &&
+        op->src[1]->type == GGML_TYPE_F32;
+}
+
+// split-K for kernel_mul_mm_wc when its grid has few tiles (e.g. the MoE router M = 256, N = 512): the
+// number of K splits, so that the grid gets closer to ~80 threadgroups (2 per CU) with >= 4 BK chunks per
+// split. 1 = no split. quantized src0 (dequant-bound) only gains when the unsplit grid leaves at least
+// half of the ~40 CUs idle; at 24-40 tiles a split is 3-15% slower there
+static int ggml_metal_op_mul_mat_ks(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (props->mm_wc <= 0 || !ggml_metal_op_mul_mat_use_tiled(op, props->has_simdgroup_mm, props->has_tensor)) {
+        return 1;
+    }
+
+    const int64_t bm      = GGML_METAL_TILED_MM_BM;
+    const int64_t tiles   = ((op->src[1]->ne[1] + bm - 1)/bm)*((op->src[0]->ne[1] + bm - 1)/bm)*op->src[1]->ne[2]*op->src[1]->ne[3];
+    const int64_t nchunks = (op->src[0]->ne[0] + 63)/64;
+
+    if (ggml_is_quantized(op->src[0]->type) && tiles > 20) {
+        return 1;
+    }
+
+    int ks = 1;
+    while (ks < 8 && tiles*ks*2 <= 80 && nchunks/(ks*2) >= 4) {
+        ks *= 2;
+    }
+
+    return ks;
+}
+
+// scratch of the split-K partial planes [batch][ks][N][M] (FP32), after the f16 activations
+size_t ggml_metal_op_mul_mat_extra_ks(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (op->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+
+    const int ks = ggml_metal_op_mul_mat_ks(op, props);
+    if (ks <= 1) {
+        return 0;
+    }
+
+    return (size_t) ks*ggml_nelements(op)*sizeof(float);
+}
+
 // Lever A: scratch for converting activations (src1) f32 -> f16 once, to halve the
 // B-staging VRAM traffic in the scalar tiled GEMM. Returned size is 0 unless this op
 // will take the tiled f16-activation path. The gate MUST match the dispatch below.
@@ -2685,19 +2743,8 @@ size_t ggml_metal_op_mul_mat_extra_b_f16(const ggml_tensor * op, bool has_simdgr
     if (op->op != GGML_OP_MUL_MAT) {
         return 0;
     }
-    if (has_simdgroup_mm || has_tensor) {
-        return 0;
-    }
-    if (op->src[1]->ne[1] <= 8) { // ne11 (N); tiled path requires ne11 > 8
-        return 0;
-    }
-    if (ggml_is_transposed(op->src[0]) || ggml_is_transposed(op->src[1])) {
-        return 0;
-    }
-    if (!ggml_metal_tiled_mm_supported(op->src[0]->type)) {
-        return 0;
-    }
-    if (op->src[1]->type != GGML_TYPE_F32) {
+    // must match the tiled dispatch in ggml_metal_op_mul_mat
+    if (!ggml_metal_op_mul_mat_use_tiled(op, has_simdgroup_mm, has_tensor)) {
         return 0;
     }
     if (!ggml_is_contiguous(op->src[1])) {
@@ -2840,10 +2887,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
-    } else if (!props_dev->has_simdgroup_mm && !props_dev->has_tensor && ne11 > 8 &&
-               !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
-               ggml_metal_tiled_mm_supported(op->src[0]->type) &&
-                op->src[1]->type == GGML_TYPE_F32) {
+    } else if (ggml_metal_op_mul_mat_use_tiled(op, props_dev->has_simdgroup_mm, props_dev->has_tensor)) {
         // scalar shared-memory tiled GEMM: third mul_mm path for GPUs with
         // neither simdgroup-matrix nor the tensor API (PoC: f16, q4_K)
 
@@ -2901,14 +2945,26 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             b_nb13 = (uint64_t) ne10 * ne11 * ne12 * sizeof(ggml_fp16_t);
         }
 
+        // split-K (kernel_mul_mm_wc only) for grids with few tiles
+        int ks = ggml_metal_op_mul_mat_ks(op, props_dev);
+
         // kernel_mul_mm_wc by default (GGML_METAL_MM_WC=0 selects kernel_mul_mm_tiled): same tile, grid and f16 scratch
         auto pipeline = props_dev->mm_wc > 0
-            ? ggml_metal_library_get_pipeline_mul_mm_wc   (lib, op, use_f16_act, props_dev->mm_wc != 2)
+            ? ggml_metal_library_get_pipeline_mul_mm_wc   (lib, op, use_f16_act, props_dev->mm_wc != 2, ks)
             : ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
 
         if (props_dev->mm_wc > 0 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 32*pipeline.nsg) {
             // cannot launch 256 threads: keep the baseline
             pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
+            ks = 1;
+        }
+
+        // with split-K the GEMM writes FP32 partial planes into a scratch after the f16 activations (see
+        // ggml_metal_op_mul_mat_extra_ks and get_alloc_size), kernel_mul_mm_wc_ksum adds them into dst
+        ggml_metal_buffer_id bid_d = ggml_metal_get_buffer_id(op);
+        if (ks > 1) {
+            const size_t offs_f16 = GGML_PAD(ggml_nbytes(op), 32);
+            bid_d.offs += GGML_PAD(use_f16_act ? offs_f16 + ggml_nelements(op->src[1])*sizeof(ggml_fp16_t) : ggml_nbytes(op), 32);
         }
 
         ggml_metal_kargs_mul_mm args = {
@@ -2932,7 +2988,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, bid_b,                                2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, bid_d,                                3);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
@@ -2940,7 +2996,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13 * ks, 32, nsg, 1);
+
+        if (ks > 1) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            auto pipeline_ksum = ggml_metal_library_get_pipeline_mul_mm_wc_ksum(lib);
+
+            GGML_ASSERT((int64_t) ne0*ne1 <= UINT32_MAX);
+            uint32_t args_ksum[2] = { (uint32_t) ((int64_t) ne0*ne1), (uint32_t) ks };
+
+            const int nth = 256;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_ksum);
+            ggml_metal_encoder_set_bytes   (enc, args_ksum, sizeof(args_ksum), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_d,                        1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) (((int64_t) ne0*ne1 + nth - 1)/nth), ne12*ne13, 1, nth, 1, 1);
+        }
 
         if (use_f16_act) {
             // protect the shared f16 scratch: the next op (e.g. another tiled matmul

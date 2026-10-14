@@ -232,6 +232,11 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 if (extra > 0) {
                     res = GGML_PAD(res, 32) + extra;
                 }
+                // split-K partial planes, after the f16 scratch (must match ggml_metal_op_mul_mat)
+                const size_t extra_ks = ggml_metal_op_mul_mat_extra_ks(tensor, props);
+                if (extra_ks > 0) {
+                    res = GGML_PAD(res, 32) + extra_ks;
+                }
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

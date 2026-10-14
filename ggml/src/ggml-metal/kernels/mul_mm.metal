@@ -9,6 +9,7 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant bool FC_mul_mm_wc_early [[function_constant(FC_MUL_MM + 7)]];
+constant short FC_mul_mm_wc_ks   [[function_constant(FC_MUL_MM + 8)]]; // kernel_mul_mm_wc: K splits (1 = off)
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -685,9 +686,20 @@ kernel void kernel_mul_mm_wc(
     const int M = args.ne0;
     const int N = args.ne1;
 
-    const int im  = tgpig.z;
+    // split-K (FC_mul_mm_wc_ks > 1, for grids with few tiles): grid z = batch*ks, each threadgroup sums
+    // whole BK chunks of its K range and writes an FP32 partial plane [ks][N][M] per batch into dst
+    // (a scratch buffer), the planes are added by kernel_mul_mm_wc_ksum
+    // KS == 1 resolves at pipeline creation to the plain expressions (the generic ones cost ~2% there)
+    const int KS  = FC_mul_mm_wc_ks;
+    const int im  = KS == 1 ? (int) tgpig.z : (int) tgpig.z / KS;
+    const int kz  = KS == 1 ? 0             : (int) tgpig.z % KS;
     const int i12 = im % FC_mul_mm_ne12;
     const int i13 = im / FC_mul_mm_ne12;
+
+    // whole BK chunks per split, the first nch % KS splits get one more
+    const int nch = (K + BK - 1)/BK;
+    const int kb0 = KS == 1 ? 0 : (kz*(nch/KS) + min(kz, nch % KS))*BK;
+    const int kb1 = KS == 1 ? K : min(K, kb0 + (nch/KS + (kz < nch % KS ? 1 : 0))*BK);
 
     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
 
@@ -724,8 +736,8 @@ kernel void kernel_mul_mm_wc(
         }
     }
 
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        if (!FC_mul_mm_wc_early && k0 > 0) {
+    for (int k0 = kb0; k0 < kb1; k0 += BK) {
+        if (!FC_mul_mm_wc_early && k0 > kb0) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -772,7 +784,7 @@ kernel void kernel_mul_mm_wc(
         }
 
         // early staging: the global loads above overlap the slower waves of the previous chunk
-        if (FC_mul_mm_wc_early && k0 > 0) {
+        if (FC_mul_mm_wc_early && k0 > kb0) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -824,7 +836,7 @@ kernel void kernel_mul_mm_wc(
         }
     }
 
-    device float * dst_f32 = (device float *) dst + (size_t) im*N*M;
+    device float * dst_f32 = (device float *) dst + ((size_t) im*KS + kz)*N*M;
 
     const bool m_vec = M % 4 == 0;
 
@@ -898,6 +910,33 @@ template [[host_name("kernel_mul_mm_wc_iq1_s_f16")]] kernel mul_mm_wc_t kernel_m
 template [[host_name("kernel_mul_mm_wc_iq1_m_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   half, half4>;
 template [[host_name("kernel_mul_mm_wc_iq4_nl_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  half, half4>;
 template [[host_name("kernel_mul_mm_wc_iq4_xs_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  half, half4>;
+
+// adds the FP32 partial planes of a split-K kernel_mul_mm_wc in a fixed order: dst[b][i] = sum_k src[b][k][i]
+// args.x = elements per plane (N*M), args.y = number of splits. grid: (ceil(args.x/ntg), batch)
+kernel void kernel_mul_mm_wc_ksum(
+        constant uint2 & args,
+        device const float * src,
+        device       float * dst,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 tpitg [[thread_position_in_threadgroup]],
+        uint2 ntg   [[threads_per_threadgroup]]) {
+    const uint n  = args.x;
+    const uint ks = args.y;
+    const uint i  = tgpig.x*ntg.x + tpitg.x;
+
+    if (i >= n) {
+        return;
+    }
+
+    device const float * s = src + (size_t) tgpig.y*ks*n + i;
+
+    float sum = 0.0f;
+    for (uint k = 0; k < ks; k++) {
+        sum += s[(size_t) k*n];
+    }
+
+    dst[(size_t) tgpig.y*n + i] = sum;
+}
 
 // activation f32->f16 convert for the f16-activation tiled path (one pass, reused scratch)
 kernel void kernel_mm_cvt_f32_f16(

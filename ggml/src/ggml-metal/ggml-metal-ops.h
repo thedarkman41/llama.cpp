@@ -35,6 +35,9 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // must match the dispatch gate in ggml_metal_op_mul_mat exactly.
 size_t ggml_metal_op_mul_mat_extra_b_f16(const struct ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor);
 
+// split-K partial planes of kernel_mul_mm_wc, after the f16 activations; 0 if no split
+size_t ggml_metal_op_mul_mat_extra_ks(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
+
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
