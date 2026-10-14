@@ -42,6 +42,17 @@ struct ggml_metal {
     bool use_graph_optimize;
 
     int debug_graph;
+    int profile_ops; // GGML_METAL_PROFILE_OPS: per-op GPU time, each op encoded in its own command buffer
+
+    // GGML_METAL_PROFILE_CB: command buffer timeline per graph, collected when the next graph starts
+    int     profile_cb;
+    int64_t pcb_n;
+    double  pcb_end_prev; // GPU end time of the last command buffer of the previous graph
+    double  pcb_busy;     // GPU time of the graph's command buffers
+    double  pcb_gap_in;   // GPU idle between the command buffers of a graph (encode bubble)
+    double  pcb_gap_out;  // GPU idle between graphs (host work, uploads)
+    double  pcb_enc_main; // host time to encode + commit the main thread's command buffer
+    double  pcb_enc_rest; // host time to encode + commit the remaining command buffers
 
     struct ggml_metal_fusion_info * finfo;
 
@@ -146,9 +157,27 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->use_concurrency = (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) &&
             (props_dev->gpu_family > 0 || getenv("GGML_METAL_CONCURRENCY_FORCE") != nil);
 
+
         {
             const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
             res->debug_graph = val ? atoi(val) : 0;
+        }
+
+        {
+            const char * val = getenv("GGML_METAL_PROFILE_OPS");
+            res->profile_ops = val ? atoi(val) : 0;
+        }
+
+        {
+            const char * val = getenv("GGML_METAL_PROFILE_CB");
+            res->profile_cb   = val ? atoi(val) : 0;
+            res->pcb_n        = 0;
+            res->pcb_end_prev = 0.0;
+            res->pcb_busy     = 0.0;
+            res->pcb_gap_in   = 0.0;
+            res->pcb_gap_out  = 0.0;
+            res->pcb_enc_main = 0.0;
+            res->pcb_enc_rest = 0.0;
         }
 
         res->use_graph_optimize = true;
@@ -197,8 +226,27 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 }
 
+static void ggml_metal_prof_print(void);
+static void ggml_metal_pcb_collect(ggml_metal_t ctx);
+
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->profile_ops) {
+        ggml_metal_prof_print();
+    }
+
+    if (ctx->profile_cb) {
+        if (ctx->cmd_buf_last) {
+            [ctx->cmd_buf_last waitUntilCompleted];
+        }
+        ggml_metal_pcb_collect(ctx);
+
+        const double n = ctx->pcb_n > 0 ? (double) ctx->pcb_n : 1.0;
+        GGML_LOG_INFO("%s: command buffer timeline over %lld graphs (ms/graph): GPU busy %.3f, gap inside graph %.3f, "
+                      "gap between graphs %.3f; host encode main %.3f, rest %.3f\n", __func__, (long long) ctx->pcb_n,
+                      1e3*ctx->pcb_busy/n, 1e3*ctx->pcb_gap_in/n, 1e3*ctx->pcb_gap_out/n, 1e3*ctx->pcb_enc_main/n, 1e3*ctx->pcb_enc_rest/n);
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -476,6 +524,169 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// GGML_METAL_PROFILE_OPS: GPU time per op (and per mul_mat type/shape), summed over all graphs,
+// printed and reset when the context is freed. Each op is committed and waited on separately,
+// so wall-clock throughput is meaningless in this mode - only the per-op shares are.
+#define GGML_METAL_PROF_MAX 512
+
+struct ggml_metal_prof_entry {
+    char    key[112];
+    double  t;
+    int64_t n;
+};
+
+static struct ggml_metal_prof_entry g_prof[GGML_METAL_PROF_MAX];
+static int     g_prof_n      = 0;
+static double  g_prof_total  = 0.0;
+static int64_t g_prof_graphs = 0;
+
+static void ggml_metal_prof_add(const char * key, double t) {
+    g_prof_total += t;
+
+    for (int i = 0; i < g_prof_n; ++i) {
+        if (strcmp(g_prof[i].key, key) == 0) {
+            g_prof[i].t += t;
+            g_prof[i].n += 1;
+            return;
+        }
+    }
+
+    if (g_prof_n < GGML_METAL_PROF_MAX) {
+        snprintf(g_prof[g_prof_n].key, sizeof(g_prof[g_prof_n].key), "%s", key);
+        g_prof[g_prof_n].t = t;
+        g_prof[g_prof_n].n = 1;
+        g_prof_n++;
+    }
+}
+
+static int ggml_metal_prof_cmp(const void * a, const void * b) {
+    const double ta = ((const struct ggml_metal_prof_entry *) a)->t;
+    const double tb = ((const struct ggml_metal_prof_entry *) b)->t;
+    return ta < tb ? 1 : (ta > tb ? -1 : 0);
+}
+
+static void ggml_metal_prof_print(void) {
+    if (g_prof_n == 0 || g_prof_total <= 0.0) {
+        return;
+    }
+
+    qsort(g_prof, g_prof_n, sizeof(g_prof[0]), ggml_metal_prof_cmp);
+
+    GGML_LOG_INFO("%s: GPU time over %lld graphs: %.3f ms total, %.3f ms/graph\n", __func__,
+            (long long) g_prof_graphs, g_prof_total*1e3, g_prof_total*1e3/MAX(1, g_prof_graphs));
+
+    for (int i = 0; i < g_prof_n; ++i) {
+        GGML_LOG_INFO("%s: %6.2f%% %10.3f ms %8lld x  %s\n", __func__,
+                100.0*g_prof[i].t/g_prof_total, g_prof[i].t*1e3, (long long) g_prof[i].n, g_prof[i].key);
+    }
+
+    g_prof_n      = 0;
+    g_prof_total  = 0.0;
+    g_prof_graphs = 0;
+}
+
+static enum ggml_status ggml_metal_graph_compute_profile(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+        if (ctx->cmd_buf_last) {
+            [ctx->cmd_buf_last waitUntilCompleted];
+            ctx->cmd_buf_last = nil;
+        }
+
+        ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+        // walk the same filtered node list as ggml_metal_op (empty / no-op nodes are skipped),
+        // so that each op is encoded exactly once and res (fused node count) indexes this list
+        int * idxs = malloc(sizeof(int)*gf->n_nodes);
+        int n_idxs = 0;
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            if (!ggml_op_is_empty(gf->nodes[i]->op) && !ggml_is_empty(gf->nodes[i])) {
+                idxs[n_idxs++] = i;
+            }
+        }
+
+        for (int p = 0; p < n_idxs; ) {
+            const int i = idxs[p];
+
+            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+            ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i, gf->n_nodes, false, false, ctx->debug_graph);
+            const int res = ggml_metal_op_encode(ctx_op, 0);
+            ggml_metal_op_free(ctx_op);
+
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: command buffer failed at node %d (%s)\n", __func__, i, ggml_op_desc(gf->nodes[i]));
+                free(idxs);
+                ctx->has_error = true;
+                return GGML_STATUS_FAILED;
+            }
+
+            if (res == 0) {
+                break;
+            }
+
+            const struct ggml_tensor * node = gf->nodes[i];
+
+            char key[112];
+            if (node->op == GGML_OP_MUL_MAT) {
+                snprintf(key, sizeof(key), "MUL_MAT %s M=%lld N=%lld K=%lld", ggml_type_name(node->src[0]->type),
+                        (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1], (long long) node->src[0]->ne[0]);
+            } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                snprintf(key, sizeof(key), "MUL_MAT_ID %s M=%lld K=%lld E=%lld tok=%lld", ggml_type_name(node->src[0]->type),
+                        (long long) node->src[0]->ne[1], (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[2],
+                        (long long) node->src[2]->ne[1]);
+            } else {
+                snprintf(key, sizeof(key), "%s%s", ggml_op_desc(node), res > 1 ? " (fused)" : "");
+            }
+
+            ggml_metal_prof_add(key, [cmd_buf GPUEndTime] - [cmd_buf GPUStartTime]);
+
+            p += res;
+        }
+
+        free(idxs);
+
+        g_prof_graphs++;
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
+// GPU timeline of the previous graph's command buffers (main thread's first, then cmd_bufs[0..n_cb))
+static void ggml_metal_pcb_collect(ggml_metal_t ctx) {
+    id<MTLCommandBuffer> cb_main = ctx->cmd_bufs[ctx->n_cb].obj;
+    if (!cb_main || [cb_main status] != MTLCommandBufferStatusCompleted) {
+        return;
+    }
+
+    double busy  = cb_main.GPUEndTime - cb_main.GPUStartTime;
+    double gap   = 0.0;
+    double e_last = cb_main.GPUEndTime;
+
+    for (int i = 0; i < ctx->n_cb; ++i) {
+        id<MTLCommandBuffer> cb = ctx->cmd_bufs[i].obj;
+        if (!cb || [cb status] != MTLCommandBufferStatusCompleted) {
+            continue;
+        }
+        gap   += MAX(0.0, cb.GPUStartTime - e_last);
+        busy  += cb.GPUEndTime - cb.GPUStartTime;
+        e_last = MAX(e_last, cb.GPUEndTime);
+    }
+
+    if (ctx->pcb_end_prev > 0.0) {
+        ctx->pcb_gap_out += MAX(0.0, cb_main.GPUStartTime - ctx->pcb_end_prev);
+    }
+
+    ctx->pcb_end_prev = e_last;
+    ctx->pcb_busy    += busy;
+    ctx->pcb_gap_in  += gap;
+    ctx->pcb_n       += 1;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -485,6 +696,16 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+
+    if (ctx->profile_ops) {
+        return ggml_metal_graph_compute_profile(ctx, gf);
+    }
+
+    if (ctx->profile_cb) {
+        ggml_metal_pcb_collect(ctx);
+    }
+
+    const int64_t pcb_t0 = ctx->profile_cb ? ggml_time_us() : 0;
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -515,6 +736,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->n_nodes_1      = gf->n_nodes - ctx->n_nodes_0;
 
             ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
+
         }
 
         if (ctx->capture_compute >= 0) {
@@ -575,6 +797,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // remember the command buffer for the next iteration
         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
 
+        const int64_t pcb_t1 = ctx->profile_cb ? ggml_time_us() : 0;
+
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
@@ -598,6 +822,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (ctx->profile_cb) {
+            ctx->pcb_enc_main += 1e-6*(pcb_t1 - pcb_t0);
+            ctx->pcb_enc_rest += 1e-6*(ggml_time_us() - pcb_t1);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
