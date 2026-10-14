@@ -435,10 +435,15 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
+
+        // the pages of the caller's memory, or a staging buffer copied out below if Metal refuses them
+        size_t offs_dst = 0;
+        id<MTLBuffer> buf_dst = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_dst);
+        const bool staged = buf_dst == nil;
+        if (staged) {
+            offs_dst = 0;
+            buf_dst  = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_dst);
 
@@ -458,11 +463,19 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         [encoder copyFromBuffer:bid_src.metal
                    sourceOffset:bid_src.offs
                        toBuffer:buf_dst
-              destinationOffset:0
+              destinationOffset:offs_dst
                            size:size];
 
         [encoder endEncoding];
         [cmd_buf commit];
+
+        if (staged) {
+            // the copy out of the staging buffer needs the blit (and the work queued before it) to be done
+            [cmd_buf waitUntilCompleted];
+            memcpy(data, [buf_dst contents], size);
+            [buf_dst release];
+            return;
+        }
 
         [ctx->buf_refs addObject:buf_dst];
         [buf_dst release];

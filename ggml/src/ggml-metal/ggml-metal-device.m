@@ -2416,12 +2416,15 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // src: the pages of the caller's memory, or a copy if Metal refuses them
+        size_t offs_src = 0;
+        id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(buf->dev, data, size, &offs_src);
+        if (buf_src == nil) {
+            offs_src = 0;
+            buf_src  = [buf->dev->mtl_device newBufferWithBytes:data
+                                                         length:size
+                                                        options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_src);
 
@@ -2439,7 +2442,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder copyFromBuffer:buf_src
-                       sourceOffset:0
+                       sourceOffset:offs_src
                            toBuffer:bid_dst.metal
                   destinationOffset:bid_dst.offs
                                size:size];
@@ -2465,6 +2468,20 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 }
 
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * ptr, size_t size, size_t * offs) {
+    const uintptr_t size_page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t base      = (uintptr_t) ptr & ~(size_page - 1);
+
+    *offs = (size_t) ((uintptr_t) ptr - base);
+
+    const size_t length = ((*offs + size + size_page - 1)/size_page)*size_page;
+
+    return [dev->mtl_device newBufferWithBytesNoCopy:(void *) base
+                                              length:length
+                                             options:MTLResourceStorageModeShared
+                                         deallocator:nil];
+}
+
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy(data, (const char *) tensor->data + offset, size);
@@ -2476,11 +2493,14 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
 
-        // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // dst: the pages of the caller's memory, or a staging buffer copied out below if Metal refuses them
+        size_t offs_dst = 0;
+        id<MTLBuffer> buf_dst = ggml_metal_device_wrap_host(buf->dev, data, size, &offs_dst);
+        const bool staged = buf_dst == nil;
+        if (staged) {
+            offs_dst = 0;
+            buf_dst  = [buf->dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_dst);
 
@@ -2492,7 +2512,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder copyFromBuffer:bid_src.metal
                        sourceOffset:bid_src.offs
                            toBuffer:buf_dst
-                  destinationOffset:0
+                  destinationOffset:offs_dst
                                size:size];
 
             [encoder endEncoding];
@@ -2500,6 +2520,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (staged) {
+            memcpy(data, [buf_dst contents], size);
+        }
 
         [buf_dst release];
     }

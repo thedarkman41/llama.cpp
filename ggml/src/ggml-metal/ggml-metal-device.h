@@ -384,6 +384,12 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
+// a shared Metal buffer over the host pages that hold [ptr, ptr + size), for blits to or from host memory:
+// newBufferWithBytesNoCopy needs a page-aligned address and length (for other addresses it can return nil,
+// seen on a Radeon Pro 5700 XT). *offs is where ptr lands in the buffer. retained; nil if Metal refuses
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * ptr, size_t size, size_t * offs); // id<MTLBuffer>
+
 bool   ggml_metal_buffer_cpy_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * src, struct ggml_tensor * dst);
 void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 
