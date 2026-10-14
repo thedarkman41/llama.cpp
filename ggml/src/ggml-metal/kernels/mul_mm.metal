@@ -407,7 +407,7 @@ void mm_tiled_stage(
                 FOR_UNROLL (short i = 0; i < 16; i++) {
                     As[(sb*16 + i)*BM + m] = (kpos + i < K) ? (half) row_ptr[kpos + i] : (half) 0;
                 }
-            } else {
+            } else if (kpos < K) {
                 const int   block_idx = kpos / (16*nl);
                 const short il        = (kpos/16) % nl;
                 device const block_q * row_ptr = (device const block_q *)(src0 + nb01*(ra + m) + offset0);
@@ -415,6 +415,11 @@ void mm_tiled_stage(
                 dequantize_func(row_ptr + block_idx, il, temp_a);
                 FOR_UNROLL (short i = 0; i < 16; i++) {
                     As[(sb*16 + i)*BM + m] = (kpos + i < K) ? (half) temp_a[i/4][i%4] : (half) 0;
+                }
+            } else {
+                // past the end of the row: do not read the next block
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    As[(sb*16 + i)*BM + m] = (half) 0;
                 }
             }
         } else {
@@ -576,6 +581,15 @@ template [[host_name("kernel_mul_mm_tiled_q4_K_f32")]]  kernel mul_mm_tiled_t ke
 template [[host_name("kernel_mul_mm_tiled_q5_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float, float4>;
 template [[host_name("kernel_mul_mm_tiled_q6_K_f32")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float, float4>;
 template [[host_name("kernel_mul_mm_tiled_iq3_s_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4>;
+template [[host_name("kernel_mul_mm_tiled_mxfp4_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_mxfp4,   2,     dequantize_mxfp4,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_xxs_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_xs_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_s_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq3_xxs_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq1_s_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq1_m_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq4_nl_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  float, float4>;
+template [[host_name("kernel_mul_mm_tiled_iq4_xs_f32")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float, float4>;
 
 template [[host_name("kernel_mul_mm_tiled_f32_f16")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, float4x4,   1,     dequantize_f32,   half, half4>;
 template [[host_name("kernel_mul_mm_tiled_f16_f16")]]   kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, half4x4,    1,     dequantize_f16,   half, half4>;
@@ -590,6 +604,15 @@ template [[host_name("kernel_mul_mm_tiled_q4_K_f16")]]  kernel mul_mm_tiled_t ke
 template [[host_name("kernel_mul_mm_tiled_q5_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  half, half4>;
 template [[host_name("kernel_mul_mm_tiled_q6_K_f16")]]  kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  half, half4>;
 template [[host_name("kernel_mul_mm_tiled_iq3_s_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, half, half4>;
+template [[host_name("kernel_mul_mm_tiled_mxfp4_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_mxfp4,   2,     dequantize_mxfp4,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_xxs_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_xs_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq2_s_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq3_xxs_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq1_s_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq1_m_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq4_nl_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  half, half4>;
+template [[host_name("kernel_mul_mm_tiled_iq4_xs_f16")]] kernel mul_mm_tiled_t kernel_mul_mm_tiled<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  half, half4>;
 
 //
 // kernel_mul_mm_wc: kernel_mul_mm_tiled with a bank-conflict-free threadgroup data path (default; GGML_METAL_MM_WC=0 selects tiled)
@@ -843,6 +866,15 @@ template [[host_name("kernel_mul_mm_wc_q4_K_f32")]]  kernel mul_mm_wc_t kernel_m
 template [[host_name("kernel_mul_mm_wc_q5_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float, float4>;
 template [[host_name("kernel_mul_mm_wc_q6_K_f32")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float, float4>;
 template [[host_name("kernel_mul_mm_wc_iq3_s_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4>;
+template [[host_name("kernel_mul_mm_wc_mxfp4_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_mxfp4,   2,     dequantize_mxfp4,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq2_xxs_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq2_xs_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq2_s_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq3_xxs_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq1_s_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq1_m_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq4_nl_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  float, float4>;
+template [[host_name("kernel_mul_mm_wc_iq4_xs_f32")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float, float4>;
 
 template [[host_name("kernel_mul_mm_wc_f32_f16")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, float4x4,    1,     dequantize_f32,   half, half4>;
 template [[host_name("kernel_mul_mm_wc_f16_f16")]]   kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, half4x4,     1,     dequantize_f16,   half, half4>;
@@ -857,6 +889,15 @@ template [[host_name("kernel_mul_mm_wc_q4_K_f16")]]  kernel mul_mm_wc_t kernel_m
 template [[host_name("kernel_mul_mm_wc_q5_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  half, half4>;
 template [[host_name("kernel_mul_mm_wc_q6_K_f16")]]  kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  half, half4>;
 template [[host_name("kernel_mul_mm_wc_iq3_s_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, half, half4>;
+template [[host_name("kernel_mul_mm_wc_mxfp4_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_mxfp4,   2,     dequantize_mxfp4,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq2_xxs_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq2_xs_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq2_s_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq3_xxs_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq1_s_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq1_m_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq4_nl_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  half, half4>;
+template [[host_name("kernel_mul_mm_wc_iq4_xs_f16")]] kernel mul_mm_wc_t kernel_mul_mm_wc<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  half, half4>;
 
 // activation f32->f16 convert for the f16-activation tiled path (one pass, reused scratch)
 kernel void kernel_mm_cvt_f32_f16(
@@ -949,7 +990,7 @@ kernel void kernel_mul_mm_id_tiled(
                     FOR_UNROLL (short i = 0; i < 16; i++) {
                         As[(sb*16 + i)*BM + m] = (kpos + i < K) ? (half) row_ptr[kpos + i] : (half) 0;
                     }
-                } else {
+                } else if (kpos < K) {
                     const int   block_idx = kpos / (16*nl);
                     const short il        = (kpos/16) % nl;
                     device const block_q * row_ptr = (device const block_q *)(src0 + args.nb01*(r0 + m) + offset0);
@@ -957,6 +998,11 @@ kernel void kernel_mul_mm_id_tiled(
                     dequantize_func(row_ptr + block_idx, il, temp_a);
                     FOR_UNROLL (short i = 0; i < 16; i++) {
                         As[(sb*16 + i)*BM + m] = (kpos + i < K) ? (half) temp_a[i/4][i%4] : (half) 0;
+                    }
+                } else {
+                    // past the end of the row: do not read the next block
+                    FOR_UNROLL (short i = 0; i < 16; i++) {
+                        As[(sb*16 + i)*BM + m] = (half) 0;
                     }
                 }
             } else {
@@ -1057,6 +1103,15 @@ template [[host_name("kernel_mul_mm_id_tiled_q4_K_f32")]]  kernel mul_mm_id_tile
 template [[host_name("kernel_mul_mm_id_tiled_q5_K_f32")]]  kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_q5_K,  QK_NL, dequantize_q5_K,  float>;
 template [[host_name("kernel_mul_mm_id_tiled_q6_K_f32")]]  kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_q6_K,  QK_NL, dequantize_q6_K,  float>;
 template [[host_name("kernel_mul_mm_id_tiled_iq3_s_f32")]] kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq3_s, QK_NL, dequantize_iq3_s, float>;
+template [[host_name("kernel_mul_mm_id_tiled_mxfp4_f32")]]   kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_mxfp4,   2,     dequantize_mxfp4,   float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq2_xxs_f32")]] kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq2_xs_f32")]]  kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq2_s_f32")]]   kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq3_xxs_f32")]] kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq1_s_f32")]]   kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq1_m_f32")]]   kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq4_nl_f32")]]  kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  float>;
+template [[host_name("kernel_mul_mm_id_tiled_iq4_xs_f32")]]  kernel mul_mm_id_tiled_t kernel_mul_mm_id_tiled<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float>;
 
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
