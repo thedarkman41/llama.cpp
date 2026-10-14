@@ -10,6 +10,7 @@ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant bool FC_mul_mm_wc_early [[function_constant(FC_MUL_MM + 7)]];
 constant short FC_mul_mm_wc_ks   [[function_constant(FC_MUL_MM + 8)]]; // kernel_mul_mm_wc: K splits (1 = off)
+constant bool  FC_mul_mm_wc_dq2  [[function_constant(FC_MUL_MM + 9)]]; // kernel_mul_mm_wc: q3_K/q4_K A loader mm_wc_dq2_row
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -620,7 +621,7 @@ template [[host_name("kernel_mul_mm_tiled_iq4_xs_f16")]] kernel mul_mm_tiled_t k
 //
 // same 128x128 tile, BK = 64, 256 threads, 8x8 micro-tile, packed-half FMA, FP32 fold per chunk, grid and numerics
 // threadgroup memory holds K-major packed half2 words, 64 words per k-row:
-//   As[k][w]  = (A[w][k], A[w+64][k])   at word w (a wave-load touches 32 consecutive rows)
+//   As[k][w]  = (A[w][k], A[w+64][k])   at word w (a wave-load touches 32 consecutive rows); with dq2 at word w ^ (((k >> 3) & 3) << 3)
 //   Bs[k][np] = (B[2np][k], B[2np+1][k]) at word np ^ (((k >> 3) & 3) << 3)
 // staging stores are full words without bank conflicts (tiled: every B store is a 16-way conflict)
 // each inner-loop operand is one 16-byte read
@@ -658,6 +659,103 @@ T0_4x4 mm_wc_load_a(
     }
 
     return r;
+}
+
+// dq2 A loaders (FC_mul_mm_wc_dq2): the quad of lanes aks = 0..3 of a row pair takes the 64-weight chunk c of a block,
+// lane aks the weights l = 8*aks..8*aks+7 of both fields of the chunk, so it reads 8 quant bytes and the scales once.
+// v[0], v[1] go to k = 8*aks + 0..7 of the chunk, v[2], v[3] to k = 32 + 8*aks + 0..7.
+// after the f16 convert the values are the same as from dequantize_q3_K / dequantize_q4_K
+template<typename block_q>
+void mm_wc_dq2_row(device const block_q * xb, int c, int aks, thread float4 * v) {
+    FOR_UNROLL (int i = 0; i < 4; i++) {
+        v[i] = float4(0.0f);
+    }
+}
+
+// q3_K chunk c: half n = c/2 of the block, fields j = 2*(c%2) + {0, 1}, weight 128*n + 32*j + l (l = 0..31)
+// x = d*(s - 32)*(u - 4), u = q2 | hbit << 2, s = 6-bit scale of sub-block 8*n + 2*j + l/16
+// (all products are exact in f32, so for finite d the f16 result equals dequantize_q3_K's)
+// blocks are 2-byte aligned: ushort loads only
+void mm_wc_dq2_row(device const block_q3_K * xb, int c, int aks, thread float4 * v) {
+    const int n  = c/2;
+    const int p  = c%2;
+    const int a2 = aks/2;
+
+    device const ushort * h16 = (device const ushort *) xb->hmask + 4*aks;
+    device const ushort * q16 = (device const ushort *) xb->qs + 16*n + 4*aks;
+    device const ushort * s16 = (device const ushort *) xb->scales;
+
+    const uint h0 = (uint) h16[0] | ((uint) h16[1] << 16);
+    const uint h1 = (uint) h16[2] | ((uint) h16[3] << 16);
+    const uint q0 = (uint) q16[0] | ((uint) q16[1] << 16);
+    const uint q1 = (uint) q16[2] | ((uint) q16[3] << 16);
+
+    // sub-blocks 8*n + 4*p + a2 (field 2*p) and + 2 (field 2*p + 1): low 4 bits in scales[4*p + a2] (+ 2), high 2 bits in scales[8 + a2] (+ 2)
+    const uint sa = s16[2*p + 0];
+    const uint sb = s16[2*p + 1];
+    const uint sh = ((uint) s16[4] | ((uint) s16[5] << 16)) >> (8*a2 + 2*(2*n + p));
+
+    const int s0 = (int) (((sa >> (8*a2 + 4*n)) & 0xF) | ((sh <<  4) & 0x30));
+    const int s1 = (int) (((sb >> (8*a2 + 4*n)) & 0xF) | ((sh >> 12) & 0x30));
+
+    const float d   = (float) xb->d;
+    const float dl0 = d*(float) (s0 - 32);
+    const float dl1 = d*(float) (s1 - 32);
+
+    FOR_UNROLL (int jj = 0; jj < 2; jj++) {
+        const int   j  = 2*p + jj;
+        const int   hb = 4*n + j;
+        const float dl = jj == 0 ? dl0 : dl1;
+
+        const uint u0 = ((q0 >> (2*j)) & 0x03030303u) | (((h0 >> hb) << 2) & 0x04040404u);
+        const uint u1 = ((q1 >> (2*j)) & 0x03030303u) | (((h1 >> hb) << 2) & 0x04040404u);
+
+        v[2*jj + 0] = fma(float4(as_type<uchar4>(u0)), float4(dl), float4(-4.0f*dl));
+        v[2*jj + 1] = fma(float4(as_type<uchar4>(u1)), float4(dl), float4(-4.0f*dl));
+    }
+}
+
+// q4_K chunk c: weight 64*c + l = low nibble of qs[32*c + l] (sub-block 2*c), 64*c + 32 + l = high nibble (sub-block 2*c + 1)
+// blocks are 16-byte aligned (the host checks the offset and the strides)
+void mm_wc_dq2_row(device const block_q4_K * xb, int c, int aks, thread float4 * v) {
+    const uint4 hdr = *((device const uint4 *) xb);
+    const uint2 qq  = *((device const uint2 *) (xb->qs + 32*c + 8*aks));
+
+    // get_scale_min_k4_just2(2*c, 0/1, scales): bytes 2*(c%2) + {0, 1} of each 4-byte group
+    const int  sh = 16*(c%2);
+    const uint y  = hdr.y >> sh;
+    const uint z  = hdr.z >> sh;
+    const uint w  = hdr.w >> sh;
+
+    uint sc0, sc1, mn0, mn1;
+    if (c < 2) {
+        sc0 =  y       & 63;
+        sc1 = (y >> 8) & 63;
+        mn0 =  z       & 63;
+        mn1 = (z >> 8) & 63;
+    } else {
+        sc0 = ( w        & 0xF) | (( y       & 0xC0) >> 2);
+        sc1 = ((w >>  8) & 0xF) | (((y >> 8) & 0xC0) >> 2);
+        mn0 = ((w >>  4) & 0xF) | (( z       & 0xC0) >> 2);
+        mn1 = ((w >> 12) & 0xF) | (((z >> 8) & 0xC0) >> 2);
+    }
+
+    const half  dh  = as_type<half2>(hdr.x)[0];
+    const float dm  = (float) as_type<half2>(hdr.x)[1];
+    const float dl0 = (float) dh*(float) sc0;
+    const float dl1 = (float) (dh/16.h)*(float) sc1;
+    const float ml0 = dm*(float) mn0;
+    const float ml1 = dm*(float) mn1;
+
+    v[0] = fma(float4(as_type<uchar4>(qq.x & 0x0F0F0F0Fu)), float4(dl0), float4(-ml0));
+    v[1] = fma(float4(as_type<uchar4>(qq.y & 0x0F0F0F0Fu)), float4(dl0), float4(-ml0));
+    v[2] = fma(float4(as_type<uchar4>(qq.x & 0xF0F0F0F0u)), float4(dl1), float4(-ml1));
+    v[3] = fma(float4(as_type<uchar4>(qq.y & 0xF0F0F0F0u)), float4(dl1), float4(-ml1));
+}
+
+// k row in the chunk of the staged A word wa[i]
+static inline int mm_wc_ka(bool dq2, int aks, int i) {
+    return dq2 ? (i < 8 ? 8*aks + i : 24 + 8*aks + i) : 16*aks + i;
 }
 
 template<
@@ -719,8 +817,11 @@ kernel void kernel_mul_mm_wc(
     const int tr = tiitg / (BN/TN);
 
     // A staging: rows arp and arp+64 (one wave-load touches 32 consecutive rows), k = 16*aks..+15
-    const int arp = tiitg % 64;
-    const int aks = tiitg / 64;
+    // dq2: the 4 lanes of a row pair are a quad (one wave-load touches 8 row pairs), k = 8*aks..+7 and 32 + 8*aks..+7,
+    // and the As word column is XOR-swizzled by aks << 3 (key (k >> 3) & 3, as Bs) to keep the stores conflict-free
+    const int arp = FC_mul_mm_wc_dq2 ? tiitg/4 : tiitg%64;
+    const int aks = FC_mul_mm_wc_dq2 ? tiitg%4 : tiitg/64;
+    const int asw = FC_mul_mm_wc_dq2 ? arp ^ (aks << 3) : arp;
 
     // B staging: cols 2*bnp and 2*bnp+1, k octets bko and bko+4 (one wave = 8 col pairs x 4 octets)
     const int lane = tiitg % 32;
@@ -742,7 +843,18 @@ kernel void kernel_mul_mm_wc(
         }
 
         uint wa[16];
-        {
+        if (FC_mul_mm_wc_dq2) {
+            // K-quants: K % 256 == 0, so every chunk is whole. rows past M read row M - 1 (their outputs are not stored)
+            device const block_q * x0 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp,      M - 1)) + k0/QK_K;
+            device const block_q * x1 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp + 64, M - 1)) + k0/QK_K;
+            float4 v0[4];
+            float4 v1[4];
+            mm_wc_dq2_row(x0, (k0/64) % 4, aks, v0);
+            mm_wc_dq2_row(x1, (k0/64) % 4, aks, v1);
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                wa[i] = as_type<uint>(half2((half) v0[i/4][i%4], (half) v1[i/4][i%4]));
+            }
+        } else {
             const int kpos = k0 + 16*aks;
             const T0_4x4 r0 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + arp,      M, K, kpos);
             const T0_4x4 r1 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + arp + 64, M, K, kpos);
@@ -754,7 +866,7 @@ kernel void kernel_mul_mm_wc(
         // late staging: store A before loading B to keep fewer registers live
         if (!FC_mul_mm_wc_early) {
             FOR_UNROLL (int i = 0; i < 16; i++) {
-                As[(16*aks + i)*NW + arp] = wa[i];
+                As[mm_wc_ka(FC_mul_mm_wc_dq2, aks, i)*NW + asw] = wa[i];
             }
         }
 
@@ -788,10 +900,10 @@ kernel void kernel_mul_mm_wc(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // a wave writes 32 consecutive words (A) or 32 distinct banks (B)
+        // a wave writes 32 consecutive words (A; 32 distinct banks with dq2) or 32 distinct banks (B)
         if (FC_mul_mm_wc_early) {
             FOR_UNROLL (int i = 0; i < 16; i++) {
-                As[(16*aks + i)*NW + arp] = wa[i];
+                As[mm_wc_ka(FC_mul_mm_wc_dq2, aks, i)*NW + asw] = wa[i];
             }
         }
         FOR_UNROLL (int t = 0; t < 2; t++) {
@@ -812,7 +924,7 @@ kernel void kernel_mul_mm_wc(
         FOR_UNROLL (int kk = 0; kk < BK; kk++) {
             const int xb = ((kk >> 3) & 3) << 3;
 
-            const uint4 ua = *((threadgroup const uint4 *)(As + kk*NW + 4*tr));
+            const uint4 ua = *((threadgroup const uint4 *)(As + kk*NW + (FC_mul_mm_wc_dq2 ? (4*tr) ^ xb : 4*tr)));
             const uint4 ub = *((threadgroup const uint4 *)(Bs + kk*NW + ((4*tc) ^ xb)));
 
             const half4 a0 = as_type<half4>(ua.xy); // rows {4tr, 4tr+64, 4tr+1, 4tr+65}

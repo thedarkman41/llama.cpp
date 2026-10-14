@@ -1289,6 +1289,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_WC=%d\n", __func__, dev->props.mm_wc);
                 }
 
+                // kernel_mul_mm_wc dq2 A loaders (FC_mul_mm_wc_dq2) for q3_K, q4_K, only used on GPUs without simdgroup-mm
+                dev->props.mm_dq2 = getenv("GGML_METAL_MM_DQ2") ? (int) strtol(getenv("GGML_METAL_MM_DQ2"), NULL, 0) : 0x3;
+                if (dev->props.mm_dq2 != 0x3) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
+                }
+
                 // v2 mat-vec bodies (FC_mul_mv_v2), only used on GPUs without simdgroup-mm
                 dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x7f;
                 if (dev->props.mv_v2 != 0x7f) {
