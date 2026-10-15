@@ -877,6 +877,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
             if (cb_idx < 2 || ctx->abort_callback == NULL || ctx->cb_serial) {
+                // a bare enqueue is fine here: it stays behind this thread's upload flush of the main command buffer
                 [cmd_buf enqueue];
 
                 // update the pointer to the last queued command buffer

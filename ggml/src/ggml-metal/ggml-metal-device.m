@@ -946,6 +946,7 @@ struct ggml_metal_upload_rec {
     uint64_t end;            // ring position after the slot
     id<MTLCommandBuffer> cb; // retained; the command buffer that reads the slot, nil while the copy is pending
     id<MTLBuffer> dst;       // retained for a deferred copy: the command buffer that runs it may not retain it
+    bool head;               // cb is a graph's main command buffer: enqueued by the flush, committed later by its owner
 };
 
 struct ggml_metal_upload_copy {
@@ -1005,6 +1006,13 @@ static struct ggml_metal_upload_rec * ggml_metal_upload_rec_at(struct ggml_metal
     return &upl->recs[(upl->recs_beg + i) % upl->recs_cap];
 }
 
+// waits under the ring lock. only a graph's main command buffer may still be just enqueued here (its owner commits it
+// without taking the lock); any other command buffer must be committed already, or the wait would never end
+static void ggml_metal_upload_wait(const struct ggml_metal_upload_rec * rec) {
+    GGML_ASSERT(rec->head || [rec->cb status] >= MTLCommandBufferStatusCommitted);
+    [rec->cb waitUntilCompleted];
+}
+
 // free the slots of the completed command buffers, oldest first (stops at the first one still in use)
 static void ggml_metal_upload_reclaim(struct ggml_metal_upload * upl) {
     while (upl->recs_n > 0) {
@@ -1049,6 +1057,7 @@ static void ggml_metal_upload_push_rec(struct ggml_metal_upload * upl, uint64_t 
     rec->end = end;
     rec->cb  = cb  ? [cb  retain] : nil;
     rec->dst = dst ? [dst retain] : nil;
+    rec->head = false;
 
     upl->recs_n++;
 }
@@ -1102,7 +1111,8 @@ static void ggml_metal_upload_flush_locked(ggml_metal_device_t dev, id<MTLComman
             if (rec->cb != nil) {
                 break;
             }
-            rec->cb = [cb retain];
+            rec->cb   = [cb retain];
+            rec->head = cb_head != nil;
         }
 
         upl->pend_n = 0;
@@ -1116,7 +1126,7 @@ static void ggml_metal_upload_wait_all(ggml_metal_device_t dev) {
     ggml_metal_upload_flush_locked(dev, nil);
 
     for (int i = 0; i < upl->recs_n; ++i) {
-        [ggml_metal_upload_rec_at(upl, i)->cb waitUntilCompleted];
+        ggml_metal_upload_wait(ggml_metal_upload_rec_at(upl, i));
     }
 
     ggml_metal_upload_reclaim(upl);
@@ -1187,7 +1197,7 @@ static size_t ggml_metal_upload_reserve(ggml_metal_device_t dev, size_t n) {
 
         GGML_ASSERT(upl->recs_n > 0);
 
-        [ggml_metal_upload_rec_at(upl, 0)->cb waitUntilCompleted];
+        ggml_metal_upload_wait(ggml_metal_upload_rec_at(upl, 0));
     }
 }
 
@@ -1205,7 +1215,7 @@ static void ggml_metal_upload_free(ggml_metal_device_t dev) {
         for (int i = 0; i < upl->recs_n; ++i) {
             struct ggml_metal_upload_rec * rec = ggml_metal_upload_rec_at(upl, i);
             if (rec->cb != nil) {
-                [rec->cb waitUntilCompleted];
+                ggml_metal_upload_wait(rec);
                 [rec->cb release];
             }
             if (rec->dst != nil) {
@@ -1239,6 +1249,10 @@ bool ggml_metal_device_upload(ggml_metal_device_t dev, void * dst, size_t dst_of
     id<MTLBuffer> buf_dst = (id<MTLBuffer>) dst;
 
     const bool defer = upl->mode == 2 && cmd_buf == NULL;
+
+    // only private buffers get deferred copies: the host reads of shared buffers (get_tensor, cpy_tensor) do not flush
+    GGML_ASSERT(buf_dst != nil);
+    GGML_ASSERT(!defer || [buf_dst storageMode] == MTLStorageModePrivate);
 
     pthread_mutex_lock(&upl->lock);
 
