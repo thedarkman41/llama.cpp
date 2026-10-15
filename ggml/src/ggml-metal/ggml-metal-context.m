@@ -936,6 +936,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     return GGML_STATUS_SUCCESS;
 }
 
+void ggml_metal_graph_canonicalize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    // the GDN_GATHER encoder runs only on the serial encoder (see ggml_metal_op_get_rows)
+    if (props_dev->dn_decode > 0 && !ctx->use_concurrency && ggml_metal_fusion_info_enabled(ctx->finfo)) {
+        ggml_graph_canonicalize_dn_decode(gf);
+    }
+}
+
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 

@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -556,6 +557,168 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     ggml_mem_ranges_free(mrs1);
 
     return res;
+}
+
+static const ggml_tensor * ggml_metal_view_root(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// ops that write only their own tensor (the nodes that a decode-GDN gather may be moved past)
+static bool ggml_metal_dn_sink_safe(ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_CONCAT:
+        case GGML_OP_MUL:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_GLU:
+        case GGML_OP_SCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_REPEAT:
+            return true;
+        default:
+            return ggml_op_is_empty(op);
+    }
+}
+
+// move the one-row GET_ROWS gather gr and its views up to `use` (the view of gr read by the node at raw index ia) to
+// right before that node; zero-size readers of gr (the empty extra-states copy of build_rs) move after raw index
+// i_last >= ia. the other nodes in between keep their order and must not write the rows or the ids that gr reads
+static bool ggml_metal_dn_sink_gather(ggml_cgraph * gf, int ia, const ggml_tensor * gr, const ggml_tensor * use, int i_last) {
+    if (gr->op != GGML_OP_GET_ROWS || ggml_nelements(gr->src[1]) != 1) {
+        return false;
+    }
+
+    std::vector<const ggml_tensor *> chain; // the views from use back to gr (exclusive)
+    for (const ggml_tensor * t = use; t != gr; t = t->src[0]) {
+        if (t == nullptr || !ggml_op_is_empty(t->op) || chain.size() >= 2) { // VIEW + RESHAPE, as in ops_gdn_gather
+            return false;
+        }
+        chain.push_back(t);
+    }
+
+    int ir = -1;
+    for (int j = ia - 1; j >= 0 && j >= ia - 1024; --j) {
+        if (gf->nodes[j] == gr) {
+            ir = j;
+            break;
+        }
+    }
+    if (ir < 0) {
+        return false;
+    }
+
+    const ggml_tensor * root0 = ggml_metal_view_root(gr->src[0]);
+    const ggml_tensor * root1 = ggml_metal_view_root(gr->src[1]);
+
+    std::vector<ggml_tensor *> keep;  // stay in order, before the gather
+    std::vector<ggml_tensor *> moved; // the chain views (in graph order), after the gather
+    std::vector<ggml_tensor *> tail;  // zero-size readers of the gather, after i_last
+    std::vector<const ggml_tensor *> dep = { gr };
+
+    for (int j = ir + 1; j < ia; ++j) {
+        ggml_tensor * node = gf->nodes[j];
+
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC && !reads; ++s) {
+            reads = node->src[s] && std::find(dep.begin(), dep.end(), node->src[s]) != dep.end();
+        }
+
+        if (reads) {
+            dep.push_back(node);
+            if (std::find(chain.begin(), chain.end(), node) != chain.end()) {
+                moved.push_back(node);
+            } else if (ggml_op_is_empty(node->op) || ggml_nelements(node) == 0) {
+                tail.push_back(node);
+            } else {
+                return false; // the gathered row has another reader
+            }
+            continue;
+        }
+
+        // the gather moves past this node: it must not write the cache rows or the row ids that the gather reads
+        if (!ggml_op_is_empty(node->op)) {
+            const ggml_tensor * root = ggml_metal_view_root(node);
+            if (!ggml_metal_dn_sink_safe(node->op) || root == root0 || root == root1) {
+                return false;
+            }
+        }
+
+        keep.push_back(node);
+    }
+
+    if (moved.size() != chain.size()) {
+        return false;
+    }
+
+    // the nodes that the tail moves past must not read it
+    for (int j = ia; j <= i_last; ++j) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (gf->nodes[j]->src[s] && std::find(tail.begin(), tail.end(), gf->nodes[j]->src[s]) != tail.end()) {
+                return false;
+            }
+        }
+    }
+
+    // [ir, i_last] -> keep, gather, chain views, [ia, i_last], tail
+    std::vector<ggml_tensor *> order;
+    order.reserve(i_last - ir + 1);
+    order.insert(order.end(), keep.begin(), keep.end());
+    order.push_back(const_cast<ggml_tensor *>(gr));
+    order.insert(order.end(), moved.begin(), moved.end());
+    for (int j = ia; j <= i_last; ++j) {
+        order.push_back(gf->nodes[j]);
+    }
+    order.insert(order.end(), tail.begin(), tail.end());
+
+    GGML_ASSERT((int) order.size() == i_last - ir + 1);
+
+    for (int j = ir; j <= i_last; ++j) {
+        gf->nodes[j] = order[j - ir];
+    }
+
+    return true;
+}
+
+// decode GDN (one token of one sequence): the recurrent state is gathered in build_rs, long before the GDN. move the
+// gather next to the GDN, so that GET_ROWS, GATED_DELTA_NET and the trailing cache CPY form the GDN_GATHER fusion
+static void ggml_metal_dn_sink_state(ggml_cgraph * gf, int ig) {
+    const ggml_tensor * gdn = gf->nodes[ig];
+    const ggml_tensor * st  = gdn->src[5];
+
+    if (ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[2] != 1 || gdn->src[2]->ne[3] != 1 || st->view_src == nullptr) {
+        return;
+    }
+
+    // the trailing cache cpy of the new state (only views in between)
+    int ic = ig + 1;
+    while (ic < gf->n_nodes && ggml_op_is_empty(gf->nodes[ic]->op)) {
+        ic++;
+    }
+    if (ic >= gf->n_nodes || gf->nodes[ic]->op != GGML_OP_CPY || gf->nodes[ic]->src[0]->view_src != gdn || ic - ig != 3) {
+        return;
+    }
+
+    ggml_metal_dn_sink_gather(gf, ig, st->view_src, st, ic);
+}
+
+void ggml_graph_canonicalize_dn_decode(ggml_cgraph * gf) {
+    for (int i = 0; i < gf->n_nodes; i++) {
+        if (gf->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_metal_dn_sink_state(gf, i);
+        }
+    }
 }
 
 void ggml_graph_optimize(ggml_cgraph * gf) {

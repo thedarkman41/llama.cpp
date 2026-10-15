@@ -1019,6 +1019,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+    uint64_t ns_row; // GDN_GATHER: row stride of the recurrent cache in floats (the state is read from row ids[0])
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

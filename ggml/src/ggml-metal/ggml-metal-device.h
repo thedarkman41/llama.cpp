@@ -134,7 +134,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool gather);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_rb(ggml_metal_library_t lib, const struct ggml_tensor * op, int lpr, int rpl);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
@@ -337,6 +337,8 @@ struct ggml_metal_device_props {
     int gdn_rb;     // GGML_METAL_GDN_RB: 1 = register-blocked GATED_DELTA_NET (default on GPUs without simdgroup-mm), 0 = off
     int gdn_rb_min; // GGML_METAL_GDN_RB_MIN: least tokens per sequence for the rb kernel (default 2: decode keeps the old kernel)
     int gdn_rb_cfg; // GGML_METAL_GDN_RB_CFG: 0 = auto, else LPR*10 + RPL in {81, 82, 42}
+
+    int dn_decode;  // GGML_METAL_DN_DECODE: 1 = the decode GDN reads its state in place from the recurrent cache (GDN_GATHER, serial encoder only; default on GPUs without simdgroup-mm), 0 = off
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

@@ -5131,6 +5131,110 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS + GGML_OP_GATED_DELTA_NET + GGML_OP_CPY: one decode step on a recurrent cache, as built by build_rs
+// and build_recurrent_attn (Metal GDN_GATHER reads the state row in place)
+struct test_gated_delta_net_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seqs;
+    const int64_t n_cells;
+    const int     row_in;   // ids[0]: cache row of the state
+    const int     row_out;  // cache row that the new state is written to
+    const int     row_zero; // cache row cleared before the gather, -1 = none
+
+    ggml_tensor * cpy_node  = nullptr;
+    ggml_tensor * attn_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR7(head_count, head_size, n_seqs, n_cells, row_in, row_out, row_zero);
+    }
+
+    test_gated_delta_net_gather(int64_t head_count = 32, int64_t head_size = 128, int64_t n_seqs = 1, int64_t n_cells = 4,
+            int row_in = 1, int row_out = 1, int row_zero = -1)
+        : head_count(head_count), head_size(head_size), n_seqs(n_seqs), n_cells(n_cells),
+          row_in(row_in), row_out(row_out), row_zero(row_zero) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H   = head_count;
+        const int64_t D   = S_v * S_v * H;
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_cells);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H, 1, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H, 1, n_seqs);
+        ggml_set_name(v,    "v");
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        // build_rs: an optional cleared row, the gather of the states, the view of the ubatch states
+        ggml_tensor * zero = nullptr;
+        if (row_zero >= 0) {
+            zero = ggml_scale_inplace(ctx, ggml_view_1d(ctx, cache, D, row_zero*cache->nb[1]), 0.0f);
+        }
+        ggml_tensor * rows  = ggml_get_rows(ctx, cache, ids);
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_view_2d(ctx, rows, D, n_seqs, rows->nb[1], 0), S_v, S_v, H, n_seqs);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn, S_v, H, 1, n_seqs,
+                ggml_row_size(gdn->type, S_v), ggml_row_size(gdn->type, S_v*H), ggml_row_size(gdn->type, S_v*H), 0);
+        ggml_set_name(attn, "attn");
+        attn_node = attn;
+
+        ggml_tensor * new_state = ggml_view_4d(ctx, gdn, S_v, S_v, H, n_seqs,
+                ggml_row_size(gdn->type, S_v), ggml_row_size(gdn->type, S_v*S_v), ggml_row_size(gdn->type, S_v*S_v*H),
+                ggml_row_size(gdn->type, S_v*H*n_seqs));
+
+        ggml_tensor * cpy = ggml_cpy(ctx, new_state, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], row_out*cache->nb[1]));
+        ggml_set_name(cpy, "gdn_cache_cpy");
+        cpy_node = cpy;
+
+        // graph order as in the model: the clear, then the gather, the gdn and the cache cpy, then the attn readers
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn));
+        if (zero) {
+            out = ggml_add(ctx, ggml_sum(ctx, zero), out);
+        }
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, attn_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (row_in + (int) i) % n_cells;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.0f); // slow decay: the new state depends on the state read
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12156,6 +12260,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // decode state gather + gdn + cache cpy: in place, another row, a third row cleared, the gathered row cleared,
+    // two sequences (not fused by Metal), a small shape
+    for (int64_t H : { 32, 48 }) {
+        test_cases.emplace_back(new test_gated_delta_net_gather(H, 128, 1, 4, 1, 1, -1));
+        test_cases.emplace_back(new test_gated_delta_net_gather(H, 128, 1, 4, 2, 0, -1));
+        test_cases.emplace_back(new test_gated_delta_net_gather(H, 128, 1, 4, 3, 3,  0));
+        test_cases.emplace_back(new test_gated_delta_net_gather(H, 128, 1, 4, 2, 2,  2));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_gather(32, 128, 2, 4, 0, 2, -1));
+    test_cases.emplace_back(new test_gated_delta_net_gather( 4,  32, 1, 3, 2, 0,  1));
 
     // register-blocked Metal path: model shapes, multi-seq, odd T, T = 2, permuted, KDA, snapshots, slow decay
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2)); // qwen3.6-35B pp512

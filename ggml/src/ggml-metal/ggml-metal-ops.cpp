@@ -1256,11 +1256,50 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// GDN_GATHER: the decode GATED_DELTA_NET reads its state in place from row ids[0] of the recurrent cache
+struct ggml_metal_gdn_gather {
+    const ggml_tensor * cache; // f32 [S_v*S_v*H, n_cells]
+    const ggml_tensor * ids;   // i32 [1]
+};
+
+static bool ggml_metal_op_gdn_rb_select(const ggml_tensor * op, const ggml_metal_device_props * props,
+        ggml_metal_buffer_id bid_out, uint64_t nb_out, int * lpr, int * rpl);
+
+static int ggml_metal_op_gated_delta_net_impl(ggml_metal_op_t ctx, int idx, const ggml_metal_gdn_gather * gather);
+
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
+
+    // GET_ROWS + GATED_DELTA_NET + CPY (GGML_METAL_DN_DECODE): the state gather is skipped; serial encoder only, the
+    // concurrent one would also need the in-place cache read in its memory ranges
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    if (props_dev->dn_decode > 0 && !ctx->use_concurrency && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GDN_GATHER) {
+            const ggml_tensor * dst_cache = ctx->node(idx + 2)->src[1];
+
+            // the register-blocked kernel has no gather variant
+            int lpr = 0;
+            int rpl = 0;
+            if (!ggml_metal_op_gdn_rb_select(ctx->node(idx + 1), props_dev, ggml_metal_get_buffer_id(dst_cache), dst_cache->nb[2]/sizeof(float), &lpr, &rpl)) {
+                ctx->count_fusions(fusion);
+
+                if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+                    GGML_LOG_DEBUG("%s: fuse: GET_ROWS + GATED_DELTA_NET + CPY\n", __func__);
+                }
+
+                const ggml_metal_gdn_gather gather = { op->src[0], op->src[1] };
+
+                return 1 + ggml_metal_op_gated_delta_net_impl(ctx, idx + 1, &gather);
+            }
+        }
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -2051,6 +2090,10 @@ static bool ggml_metal_op_gdn_rb_select(const ggml_tensor * op, const ggml_metal
 }
 
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_gated_delta_net_impl(ctx, idx, nullptr);
+}
+
+static int ggml_metal_op_gated_delta_net_impl(ggml_metal_op_t ctx, int idx, const ggml_metal_gdn_gather * gather) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -2074,7 +2117,14 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     uint64_t nb_out = 0;
     int n_fuse = 1;
 
-    if (use_fusion) {
+    if (gather) {
+        // the GDN_GATHER check includes the GDN_CACHE conditions of the trailing cpy
+        const ggml_tensor * dst_cache = ctx->node(idx + 1)->src[1];
+
+        bid_out = ggml_metal_get_buffer_id(dst_cache);
+        nb_out  = dst_cache->nb[2]/sizeof(float);
+        n_fuse = 2;
+    } else if (use_fusion) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
 
@@ -2099,9 +2149,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     int rb_rpl = 0;
     const bool use_rb = ggml_metal_op_gdn_rb_select(op, props_dev, bid_out, nb_out, &rb_lpr, &rb_rpl);
 
+    GGML_ASSERT(!use_rb || gather == nullptr); // checked by the caller
+
     auto pipeline = use_rb
         ? ggml_metal_library_get_pipeline_gated_delta_net_rb(lib, op, rb_lpr, rb_rpl)
-        : ggml_metal_library_get_pipeline_gated_delta_net   (lib, op);
+        : ggml_metal_library_get_pipeline_gated_delta_net   (lib, op, gather != nullptr);
 
     int ida = 0;
 
@@ -2142,6 +2194,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
         /*.nb_out =*/ nb_out,
+        /*.ns_row =*/ gather ? gather->cache->nb[1]/sizeof(float) : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2151,9 +2204,14 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gather ? gather->cache : op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+
+    if (!use_rb) {
+        // row index of the state in the cache (unused without gather)
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gather ? gather->ids : op->src[5]), ida++);
+    }
 
     if (use_rb) {
         GGML_ASSERT(pipeline.smem <= props_dev->max_theadgroup_memory_size);

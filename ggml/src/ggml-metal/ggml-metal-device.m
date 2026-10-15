@@ -1340,6 +1340,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                             dev->props.gdn_rb, dev->props.gdn_rb_min, dev->props.gdn_rb_cfg);
                 }
 
+                // decode GATED_DELTA_NET reads its state in place from the recurrent cache: default on GPUs without simdgroup-mm
+                dev->props.dn_decode = getenv("GGML_METAL_DN_DECODE") ? atoi(getenv("GGML_METAL_DN_DECODE")) : (dev->props.has_simdgroup_mm ? 0 : 1);
+                if (getenv("GGML_METAL_DN_DECODE")) {
+                    GGML_LOG_INFO("%s: GGML_METAL_DN_DECODE=%d\n", __func__, dev->props.dn_decode);
+                }
+
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {

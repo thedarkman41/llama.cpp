@@ -288,6 +288,150 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+static int32_t ggml_metal_fusion_use_count(const ggml_cgraph * gf, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&gf->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(gf->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return gf->use_counts[pos];
+}
+
+// the only reader of the gathered row gr (raw index i_gr) that does work is `reader`, which reads it through the view
+// `use` as its src[s_use]: follow the views of gr until every use is accounted for, up to 256 nodes past i_end (the graph
+// reorder can pull other nodes in between). other readers may only be zero-size nodes, which the encoder never
+// dispatches (the empty extra-states copy of build_rs)
+static bool ggml_metal_fusion_gather_readers_ok(const ggml_cgraph * gf, int i_gr, int i_end,
+        const ggml_tensor * gr, const ggml_tensor * reader, const ggml_tensor * use, int s_use) {
+    struct gr_use { const ggml_tensor * t; int32_t n; };
+    gr_use uses[8];
+    int n_uses = 0;
+    int n_left = 0;
+
+    if (gr->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+
+    uses[n_uses++] = { gr, ggml_metal_fusion_use_count(gf, gr) };
+    n_left += uses[0].n;
+
+    for (int j = i_gr + 1; j < gf->n_nodes && j <= i_end + 256 && (n_left > 0 || j <= i_end); ++j) {
+        const ggml_tensor * node = gf->nodes[j];
+
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (src == nullptr || (src != gr && src->view_src != gr)) {
+                continue;
+            }
+
+            int k = 0;
+            while (k < n_uses && uses[k].t != src) {
+                k++;
+            }
+            if (k == n_uses) {
+                return false; // a view of the gathered row that was not seen
+            }
+            uses[k].n--;
+            n_left--;
+
+            if (ggml_op_is_empty(node->op)) {
+                if (node->view_src != gr || n_uses == 8 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    return false;
+                }
+                uses[n_uses++] = { node, ggml_metal_fusion_use_count(gf, node) };
+                n_left += uses[n_uses - 1].n;
+            } else if (!(node == reader && src == use && s == s_use) && ggml_nelements(node) != 0) {
+                return false;
+            }
+        }
+    }
+
+    for (int k = 0; k < n_uses; ++k) {
+        if (uses[k].n != 0) {
+            return false;
+        }
+    }
+
+    return n_left == 0;
+}
+
+// GET_ROWS + GATED_DELTA_NET + CPY, decode (see ggml_graph_canonicalize_dn_decode): the gdn reads its state straight
+// from the gathered cache row ids[0] and the copy is skipped. each state element is read and written back by the
+// same thread, so reading row ids[0] while the fused cache cpy writes row kv_head of the same cache is race-free
+static bool ggml_metal_fusion_check_gdn_gather(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * gr  = nodes[0];
+    const ggml_tensor * gdn = nodes[1];
+    const ggml_tensor * cpy = nodes[2];
+
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_metal_fusion_check_gdn_cache(fusion, nodes + 1, gf, node_idxs, idx + 1, mode)) {
+        return false;
+    }
+
+    // the raw nodes must be exactly ops_all: ggml_metal_fusion_add_alloc_deps keeps the inputs (ids included) alive
+    // to the cpy only for that raw sequence
+    const int raw_start = node_idxs[idx];
+    const int raw_count = node_idxs[idx + 2] - raw_start + 1;
+    if (raw_count != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int i = 0; i < raw_count; ++i) {
+        if (gf->nodes[raw_start + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    // one token of one sequence, final state only
+    if (ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[2] != 1 || gdn->src[2]->ne[3] != 1) {
+        return false;
+    }
+
+    const int64_t S_v = gdn->src[2]->ne[0];
+    const int64_t H   = gdn->src[2]->ne[1];
+    const int64_t D   = S_v*S_v*H;
+
+    const ggml_tensor * cache = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+    const ggml_tensor * st    = gdn->src[5];
+
+    // one f32 row of exactly one state, from a 2D cache of non-overlapping rows
+    if (gr->type != GGML_TYPE_F32 || cache->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+        cache->ne[0] != D || cache->ne[2] != 1 || cache->ne[3] != 1 ||
+        cache->nb[0] != sizeof(float) || cache->nb[1] < (size_t) D*sizeof(float) || cache->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+
+    // the gdn state is the gathered row itself
+    if (st->type != GGML_TYPE_F32 || st->view_src != gr || st->view_offs != 0 || !ggml_is_contiguous(st)) {
+        return false;
+    }
+
+    // the cpy writes one whole row of the same cache: the row read in place is either that row or disjoint from it
+    const ggml_tensor * dst = cpy->src[1];
+    const ggml_tensor * root = cache->view_src ? cache->view_src : cache;
+    const ggml_tensor * root_dst = dst->view_src ? dst->view_src : dst;
+    const int64_t offs = (int64_t) dst->view_offs - (int64_t) cache->view_offs;
+    if (root != root_dst || offs < 0 || offs % (int64_t) cache->nb[1] != 0) {
+        return false;
+    }
+
+    if (!ggml_metal_fusion_gather_readers_ok(gf, node_idxs[idx], node_idxs[idx + 2], gr, gdn, st, 5)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (cache->data == nullptr || ids->data == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -725,6 +869,11 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+// raw order after ggml_graph_canonicalize_dn_decode: gather, state views, gdn, snapshot and cache views, cpy
+static const std::vector<ggml_op> ops_gdn_gather = {
+    GGML_OP_GET_ROWS, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY
+};
+
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
@@ -785,6 +934,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_GDN_GATHER,     ops_gdn_gather,             {1},    true,  ggml_metal_fusion_check_gdn_gather },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1043,6 +1193,12 @@ static bool ggml_metal_fusion_check_memory_ranges(
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = nodes[j]->src[s];
                 if (!src || src->op == GGML_OP_NONE || same_memory(src, dst)) {
+                    continue;
+                }
+
+                // the gather of GDN_GATHER reads a cache row in place while the fused cpy writes a row of the same
+                // cache; the pattern check proves that the two rows are the same row or disjoint
+                if (fusion->id == GGML_METAL_FUSION_GDN_GATHER && j == 0 && s == 0 && dst->op == GGML_OP_CPY) {
                     continue;
                 }
 

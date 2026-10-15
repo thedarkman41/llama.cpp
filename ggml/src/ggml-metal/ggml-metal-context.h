@@ -26,6 +26,9 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
 void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
 
+// decode-graph canonicalization for fusions that need nodes moved together; runs before the fusion alloc deps
+void ggml_metal_graph_canonicalize(ggml_metal_t ctx, struct ggml_cgraph * gf);
+
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 

@@ -3,6 +3,7 @@
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
+constant bool  FC_gated_delta_net_gather [[function_constant(FC_GATED_DELTA_NET + 3)]];
 
 #if 1
 template<short NSG>
@@ -16,6 +17,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * s,
         device       char * dst,
         device       char * dst_fuse,
+        device const char * ids,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -39,6 +41,12 @@ kernel void kernel_gated_delta_net_impl(
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
     const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
     device const float * s_ptr = (device const float *) (s) + state_in_base;
+
+    if (FC_gated_delta_net_gather) {
+        // GDN_GATHER: s is the recurrent cache and the state of seq i23 is its row ids[i23]. each thread reads
+        // the same elements that it writes back below, so the in-place update of that row is race-free
+        s_ptr = (device const float *) (s) + (uint64_t) ((device const int32_t *) ids)[i23]*args.ns_row + (i21*S_v*S_v + i20*S_v);
+    }
 
     float ls[NSG];
 
