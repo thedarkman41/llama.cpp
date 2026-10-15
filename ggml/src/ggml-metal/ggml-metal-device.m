@@ -11,6 +11,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <pthread.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -917,7 +918,420 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // staging ring for small host -> device uploads
+    struct ggml_metal_upload * upl;
 };
+
+//
+// staging ring for small host -> device uploads (GGML_METAL_UPLOAD_RING)
+//
+// a new shared buffer per upload costs two IOKit calls (create + destroy): ~0.6-0.75 ms per decode token on a Radeon
+// Pro 5700 XT, while the GPU idles between graphs. the ring is one persistent shared buffer: an upload copies its data
+// into a free slot, and a slot is reused only after the command buffer that reads it is done. a full ring grows up to
+// GGML_METAL_UPLOAD_RING_MAX MiB (default 64), then an upload waits for the oldest command buffer.
+//
+// GGML_METAL_UPLOAD_RING:
+//   0 = off: a new shared buffer per upload
+//   1 = ring, one blit command buffer per upload, committed right away
+//   2 = ring, the blits wait for the next submission to the device queue: they go at the head of the next graph, or
+//       into a command buffer of their own if something else is submitted first (every submission calls
+//       ggml_metal_device_upload_flush first). default on GPUs without simdgroup-mm
+//
+
+#define GGML_METAL_UPLOAD_ALIGN       256
+#define GGML_METAL_UPLOAD_MAX_PENDING 256
+
+struct ggml_metal_upload_rec {
+    uint64_t end;            // ring position after the slot
+    id<MTLCommandBuffer> cb; // retained; the command buffer that reads the slot, nil while the copy is pending
+    id<MTLBuffer> dst;       // retained for a deferred copy: the command buffer that runs it may not retain it
+};
+
+struct ggml_metal_upload_copy {
+    id<MTLBuffer> dst; // not retained (the slot record holds it)
+    size_t dst_offs;
+    size_t src_offs;
+    size_t size;
+};
+
+struct ggml_metal_upload {
+    pthread_mutex_t lock;
+
+    int mode;
+
+    id<MTLBuffer> buf; // nil until the first upload
+    uint8_t * data;
+    size_t    size;
+    size_t    size_max;
+
+    uint64_t head; // next free ring position
+    uint64_t tail; // oldest ring position still in use (positions grow monotonically, offset = pos % size)
+
+    // slots in use, oldest first (circular)
+    struct ggml_metal_upload_rec * recs;
+    int recs_cap;
+    int recs_beg;
+    int recs_n;
+
+    // mode 2: copies not encoded yet, in upload order
+    struct ggml_metal_upload_copy * pend;
+    int pend_cap;
+    int pend_n;
+};
+
+static struct ggml_metal_upload * ggml_metal_upload_init(int mode) {
+    struct ggml_metal_upload * upl = calloc(1, sizeof(struct ggml_metal_upload));
+
+    pthread_mutex_init(&upl->lock, NULL);
+
+    upl->mode     = mode;
+    upl->size_max = 64ull*1024*1024;
+
+    if (getenv("GGML_METAL_UPLOAD_RING_MAX")) {
+        upl->size_max = MAX(1, atoi(getenv("GGML_METAL_UPLOAD_RING_MAX")))*1024ull*1024ull;
+    }
+
+    return upl;
+}
+
+static bool ggml_metal_upload_cb_done(id<MTLCommandBuffer> cb) {
+    const MTLCommandBufferStatus status = [cb status];
+
+    return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
+}
+
+static struct ggml_metal_upload_rec * ggml_metal_upload_rec_at(struct ggml_metal_upload * upl, int i) {
+    return &upl->recs[(upl->recs_beg + i) % upl->recs_cap];
+}
+
+// free the slots of the completed command buffers, oldest first (stops at the first one still in use)
+static void ggml_metal_upload_reclaim(struct ggml_metal_upload * upl) {
+    while (upl->recs_n > 0) {
+        struct ggml_metal_upload_rec * rec = ggml_metal_upload_rec_at(upl, 0);
+        if (rec->cb == nil || !ggml_metal_upload_cb_done(rec->cb)) {
+            break;
+        }
+
+        upl->tail = rec->end;
+
+        [rec->cb release];
+        rec->cb = nil;
+
+        if (rec->dst != nil) {
+            [rec->dst release];
+            rec->dst = nil;
+        }
+
+        upl->recs_beg = (upl->recs_beg + 1) % upl->recs_cap;
+        upl->recs_n--;
+    }
+}
+
+static void ggml_metal_upload_push_rec(struct ggml_metal_upload * upl, uint64_t end, id<MTLCommandBuffer> cb, id<MTLBuffer> dst) {
+    if (upl->recs_n == upl->recs_cap) {
+        const int cap = upl->recs_cap > 0 ? 2*upl->recs_cap : 64;
+
+        struct ggml_metal_upload_rec * recs = malloc(cap*sizeof(struct ggml_metal_upload_rec));
+        for (int i = 0; i < upl->recs_n; ++i) {
+            recs[i] = *ggml_metal_upload_rec_at(upl, i);
+        }
+
+        free(upl->recs);
+
+        upl->recs     = recs;
+        upl->recs_cap = cap;
+        upl->recs_beg = 0;
+    }
+
+    struct ggml_metal_upload_rec * rec = &upl->recs[(upl->recs_beg + upl->recs_n) % upl->recs_cap];
+
+    rec->end = end;
+    rec->cb  = cb  ? [cb  retain] : nil;
+    rec->dst = dst ? [dst retain] : nil;
+
+    upl->recs_n++;
+}
+
+// encode the pending copies into cb_head (already enqueued by the caller), or into a command buffer of their own
+// that is committed here. the lock is held
+static void ggml_metal_upload_flush_locked(ggml_metal_device_t dev, id<MTLCommandBuffer> cb_head) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    if (upl->pend_n == 0) {
+        return;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = cb_head ? cb_head : [dev->mtl_queue commandBuffer];
+
+        id<MTLBlitCommandEncoder> encoder = [cb blitCommandEncoder];
+
+        int i0 = 0; // first copy of the current encoder
+
+        for (int i = 0; i < upl->pend_n; ++i) {
+            const struct ggml_metal_upload_copy * c = &upl->pend[i];
+
+            // a copy that overlaps an earlier one of the same encoder starts a new encoder, so the two stay in order
+            for (int j = i0; j < i; ++j) {
+                const struct ggml_metal_upload_copy * p = &upl->pend[j];
+                if (p->dst == c->dst && p->dst_offs < c->dst_offs + c->size && c->dst_offs < p->dst_offs + p->size) {
+                    [encoder endEncoding];
+                    encoder = [cb blitCommandEncoder];
+                    i0 = i;
+                    break;
+                }
+            }
+
+            [encoder copyFromBuffer:upl->buf
+                       sourceOffset:c->src_offs
+                           toBuffer:c->dst
+                  destinationOffset:c->dst_offs
+                               size:c->size];
+        }
+
+        [encoder endEncoding];
+
+        if (cb_head == nil) {
+            [cb commit];
+        }
+
+        // the pending slots are the newest ones: they are read by cb now
+        for (int i = upl->recs_n - 1; i >= 0; --i) {
+            struct ggml_metal_upload_rec * rec = ggml_metal_upload_rec_at(upl, i);
+            if (rec->cb != nil) {
+                break;
+            }
+            rec->cb = [cb retain];
+        }
+
+        upl->pend_n = 0;
+    }
+}
+
+// wait until no command buffer reads the ring any more. the lock is held
+static void ggml_metal_upload_wait_all(ggml_metal_device_t dev) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    ggml_metal_upload_flush_locked(dev, nil);
+
+    for (int i = 0; i < upl->recs_n; ++i) {
+        [ggml_metal_upload_rec_at(upl, i)->cb waitUntilCompleted];
+    }
+
+    ggml_metal_upload_reclaim(upl);
+
+    GGML_ASSERT(upl->recs_n == 0);
+}
+
+// reserve n bytes of the ring (n is a multiple of GGML_METAL_UPLOAD_ALIGN), returns the offset. the lock is held
+static size_t ggml_metal_upload_reserve(ggml_metal_device_t dev, size_t n) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    for (;;) {
+        ggml_metal_upload_reclaim(upl);
+
+        if (upl->recs_n == 0) {
+            upl->head = 0;
+            upl->tail = 0;
+        }
+
+        if (upl->buf != nil && n <= upl->size) {
+            uint64_t pos = upl->head;
+
+            // a slot does not wrap around the end of the ring: skip the rest of the ring if it does not fit
+            const size_t offs = pos % upl->size;
+            if (offs + n > upl->size) {
+                pos += upl->size - offs;
+            }
+
+            if (pos + n - upl->tail <= upl->size) {
+                upl->head = pos + n;
+
+                return (size_t) (pos % upl->size);
+            }
+        }
+
+        if (upl->buf == nil || upl->size < upl->size_max || n > upl->size) {
+            // (re)allocate: wait until nothing reads the old ring, then replace it with one twice as large
+            ggml_metal_upload_wait_all(dev);
+
+            const size_t size_page = sysconf(_SC_PAGESIZE);
+
+            size_t size_new = upl->buf == nil ? 2ull*1024*1024 : 2*upl->size;
+            size_new = MAX(size_new, n);
+            size_new = ((size_new + size_page - 1)/size_page)*size_page;
+
+            id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:size_new options:MTLResourceStorageModeShared];
+            if (buf == nil) {
+                GGML_ABORT("%s: failed to allocate the upload ring (%zu bytes)\n", __func__, size_new);
+            }
+
+            if (upl->buf != nil) {
+                [upl->buf release];
+            }
+
+            upl->buf  = buf;
+            upl->data = (uint8_t *) [buf contents];
+            upl->size = size_new;
+            upl->head = 0;
+            upl->tail = 0;
+
+            GGML_LOG_DEBUG("%s: upload ring = %.2f MiB\n", __func__, size_new/1024.0/1024.0);
+
+            continue;
+        }
+
+        // full at the maximum size: wait for the oldest command buffer that reads the ring
+        ggml_metal_upload_flush_locked(dev, nil);
+
+        GGML_ASSERT(upl->recs_n > 0);
+
+        [ggml_metal_upload_rec_at(upl, 0)->cb waitUntilCompleted];
+    }
+}
+
+static void ggml_metal_upload_free(ggml_metal_device_t dev) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    if (upl == NULL) {
+        return;
+    }
+
+    @autoreleasepool {
+        // copies that no submission needed are dropped
+        upl->pend_n = 0;
+
+        for (int i = 0; i < upl->recs_n; ++i) {
+            struct ggml_metal_upload_rec * rec = ggml_metal_upload_rec_at(upl, i);
+            if (rec->cb != nil) {
+                [rec->cb waitUntilCompleted];
+                [rec->cb release];
+            }
+            if (rec->dst != nil) {
+                [rec->dst release];
+            }
+        }
+        upl->recs_n = 0;
+
+        if (upl->buf != nil) {
+            [upl->buf release];
+        }
+    }
+
+    free(upl->recs);
+    free(upl->pend);
+
+    pthread_mutex_destroy(&upl->lock);
+
+    free(upl);
+
+    dev->upl = NULL;
+}
+
+bool ggml_metal_device_upload(ggml_metal_device_t dev, void * dst, size_t dst_offs, const void * data, size_t size, void ** cmd_buf) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    if (upl == NULL || upl->mode == 0 || size == 0) {
+        return false;
+    }
+
+    id<MTLBuffer> buf_dst = (id<MTLBuffer>) dst;
+
+    const bool defer = upl->mode == 2 && cmd_buf == NULL;
+
+    pthread_mutex_lock(&upl->lock);
+
+    @autoreleasepool {
+        const size_t src_offs = ggml_metal_upload_reserve(dev, GGML_PAD(size, GGML_METAL_UPLOAD_ALIGN));
+
+        memcpy(upl->data + src_offs, data, size);
+
+        if (defer) {
+            if (upl->pend_n == upl->pend_cap) {
+                upl->pend_cap = upl->pend_cap > 0 ? 2*upl->pend_cap : 32;
+                upl->pend     = realloc(upl->pend, upl->pend_cap*sizeof(struct ggml_metal_upload_copy));
+            }
+
+            upl->pend[upl->pend_n++] = (struct ggml_metal_upload_copy) { buf_dst, dst_offs, src_offs, size };
+
+            ggml_metal_upload_push_rec(upl, upl->head, nil, buf_dst);
+
+            if (upl->pend_n >= GGML_METAL_UPLOAD_MAX_PENDING) {
+                ggml_metal_upload_flush_locked(dev, nil);
+            }
+        } else {
+            // copies uploaded earlier go first
+            ggml_metal_upload_flush_locked(dev, nil);
+
+            // retained references, like the per-upload buffers before: the command buffer keeps the destination alive
+            id<MTLCommandBuffer> cb = [dev->mtl_queue commandBuffer];
+
+            id<MTLBlitCommandEncoder> encoder = [cb blitCommandEncoder];
+
+            [encoder copyFromBuffer:upl->buf
+                       sourceOffset:src_offs
+                           toBuffer:buf_dst
+                  destinationOffset:dst_offs
+                               size:size];
+
+            [encoder endEncoding];
+
+            [cb commit];
+
+            ggml_metal_upload_push_rec(upl, upl->head, cb, nil);
+
+            if (cmd_buf) {
+                *cmd_buf = [cb retain];
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&upl->lock);
+
+    return true;
+}
+
+void ggml_metal_device_upload_flush(ggml_metal_device_t dev, void * cmd_buf) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>) cmd_buf;
+
+    if (upl == NULL || upl->mode != 2) {
+        if (cb != nil) {
+            [cb enqueue];
+        }
+        return;
+    }
+
+    pthread_mutex_lock(&upl->lock);
+
+    // enqueue and take the pending copies under the lock: a command buffer enqueued by another thread after this
+    // point cannot get ahead of the copies taken here
+    if (cb != nil) {
+        [cb enqueue];
+    }
+
+    ggml_metal_upload_flush_locked(dev, cb);
+
+    pthread_mutex_unlock(&upl->lock);
+}
+
+void ggml_metal_device_upload_reclaim(ggml_metal_device_t dev) {
+    struct ggml_metal_upload * upl = dev->upl;
+
+    if (upl == NULL || upl->mode == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&upl->lock);
+
+    @autoreleasepool {
+        ggml_metal_upload_reclaim(upl);
+    }
+
+    pthread_mutex_unlock(&upl->lock);
+}
 
 //
 // MTLResidenceSet wrapper
@@ -1427,6 +1841,15 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
                 GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
 
+                {
+                    const char * val = getenv("GGML_METAL_UPLOAD_RING");
+                    const int mode = val ? atoi(val) : (dev->props.has_simdgroup_mm ? 0 : 2);
+
+                    dev->upl = ggml_metal_upload_init(MAX(0, MIN(2, mode)));
+
+                    GGML_LOG_INFO("%s: upload ring           = %d\n", __func__, dev->upl->mode);
+                }
+
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
                 if (@available(macOS 10.12, iOS 16.0, *)) {
                     GGML_LOG_INFO("%s: recommendedMaxWorkingSetSize  = %8.2f MB\n", __func__, dev->props.max_working_set_size / 1e6);
@@ -1449,6 +1872,8 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
 
         ggml_metal_library_free(dev->library);
         dev->library = NULL;
+
+        ggml_metal_upload_free(dev);
 
         if (dev->mtl_queue) {
             [dev->mtl_queue release];
@@ -2348,6 +2773,9 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
             [buf->buffers[i].metal release];
         }
 
+        // the upload ring holds the destinations of its finished copies until the next upload: let them go now
+        ggml_metal_device_upload_reclaim(buf->dev);
+
         ggml_metal_buffer_rset_free(buf);
     }
 
@@ -2375,6 +2803,8 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
         memset((char *) tensor->data + offset, value, size);
         return;
     }
+
+    ggml_metal_device_upload_flush(buf->dev, NULL);
 
     @autoreleasepool {
         // dst
@@ -2423,6 +2853,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             }
             bid_dst.offs += offset;
 
+            // GGML_METAL_UPLOAD_RING: the data goes through the staging ring, no new buffer
+            if (ggml_metal_device_upload(buf->dev, bid_dst.metal, bid_dst.offs, data, size, NULL)) {
+                return;
+            }
+
             id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data
                                                                       length:size
                                                                      options:MTLResourceStorageModeShared];
@@ -2447,6 +2882,8 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         return;
     }
+
+    ggml_metal_device_upload_flush(buf->dev, NULL);
 
     @autoreleasepool {
         // src: the pages of the caller's memory, or a copy if Metal refuses them
@@ -2521,6 +2958,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         return;
     }
 
+    ggml_metal_device_upload_flush(buf->dev, NULL);
+
     @autoreleasepool {
         // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
@@ -2573,6 +3012,11 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
         return true;
     }
 
+    ggml_metal_device_upload_flush(buf_src->dev, NULL);
+    if (buf_dst->dev != buf_src->dev) {
+        ggml_metal_device_upload_flush(buf_dst->dev, NULL);
+    }
+
     // for private buffers, we need to use Metal blit commands
     @autoreleasepool {
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf_src, src);
@@ -2608,6 +3052,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
         memset(buf->all_data, value, buf->all_size);
         return;
     }
+
+    ggml_metal_device_upload_flush(buf->dev, NULL);
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];

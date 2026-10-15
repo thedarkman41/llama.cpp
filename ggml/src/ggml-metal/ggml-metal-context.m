@@ -388,6 +388,24 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     @autoreleasepool {
+        // GGML_METAL_UPLOAD_RING: small copies go through the staging ring, in a command buffer of their own
+        if (size <= 128*1024) {
+            struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(tensor);
+            if (bid_dst.metal == nil) {
+                GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+            }
+
+            id<MTLCommandBuffer> cmd_buf = nil;
+            if (ggml_metal_device_upload(ctx->dev, bid_dst.metal, bid_dst.offs + offset, data, size, (void **) &cmd_buf)) {
+                // retained by ggml_metal_device_upload, released in ggml_metal_synchronize
+                [ctx->cmd_bufs_ext addObject:cmd_buf];
+                ctx->cmd_buf_last = cmd_buf;
+                return;
+            }
+        }
+
+        ggml_metal_device_upload_flush(ctx->dev, NULL);
+
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         id<MTLBuffer> buf_src = [device newBufferWithBytes:data
@@ -433,6 +451,8 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_metal_device_upload_flush(ctx->dev, NULL);
+
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
 
@@ -498,6 +518,11 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         if (bid_src.metal == nil || bid_dst.metal == nil) {
             return false;
+        }
+
+        ggml_metal_device_upload_flush(ctx_src->dev, NULL);
+        if (ctx_dst->dev != ctx_src->dev) {
+            ggml_metal_device_upload_flush(ctx_dst->dev, NULL);
         }
 
         id<MTLCommandQueue> dst_queue = ggml_metal_device_get_queue(ctx_dst->dev);
@@ -616,6 +641,8 @@ static enum ggml_status ggml_metal_graph_compute_profile(ggml_metal_t ctx, struc
             [ctx->cmd_buf_last waitUntilCompleted];
             ctx->cmd_buf_last = nil;
         }
+
+        ggml_metal_device_upload_flush(ctx->dev, NULL);
 
         ggml_metal_device_rsets_keep_alive(ctx->dev);
 
@@ -825,7 +852,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
 
-            [cmd_buf enqueue];
+            // enqueues cmd_buf; deferred uploads (GGML_METAL_UPLOAD_RING=2) are blitted at its head
+            ggml_metal_device_upload_flush(ctx->dev, cmd_buf);
 
             ctx->encode_async(n_cb);
         }
@@ -956,6 +984,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 }
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_device_upload_flush(ctx->dev, NULL);
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
@@ -972,6 +1002,8 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 }
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_device_upload_flush(ctx->dev, NULL);
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];

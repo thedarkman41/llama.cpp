@@ -366,6 +366,17 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
 
+// staging ring for small host -> device uploads (GGML_METAL_UPLOAD_RING, see ggml-metal-device.m)
+// upload: copies data into the ring and blits it to dst (id<MTLBuffer>) at dst_offs. with cmd_buf, the blit is
+// committed in its own command buffer, returned retained; without it, mode 2 defers the blit to the next flush.
+// returns false if the ring is off (the caller uses its old path)
+bool ggml_metal_device_upload(ggml_metal_device_t dev, void * dst, size_t dst_offs, const void * data, size_t size, void ** cmd_buf);
+// call before any submission to the device queue. with cmd_buf (id<MTLCommandBuffer>), it enqueues cmd_buf and encodes
+// the deferred blits at its head; without it, they get a command buffer of their own
+void ggml_metal_device_upload_flush(ggml_metal_device_t dev, void * cmd_buf);
+// releases what the ring holds for finished copies
+void ggml_metal_device_upload_reclaim(ggml_metal_device_t dev);
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
