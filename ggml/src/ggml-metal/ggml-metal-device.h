@@ -108,7 +108,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst, bool i32);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
@@ -128,7 +128,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri      
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu, bool rows);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_tiled    (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
@@ -339,6 +339,7 @@ struct ggml_metal_device_props {
     int gdn_rb_cfg; // GGML_METAL_GDN_RB_CFG: 0 = auto, else LPR*10 + RPL in {81, 82, 42}
 
     int dn_decode;  // GGML_METAL_DN_DECODE: 1 = the decode GDN reads its state in place from the recurrent cache (GDN_GATHER, serial encoder only; default on GPUs without simdgroup-mm), 0 = off
+    int dn_conv;    // GGML_METAL_DN_CONV: bitmask of the decode conv-chain paths: bit 0 CONCAT with a 1-wide transposed source on the generic kernel, bit 1 CPY with 32-bit indexing, bit 2 one-token SSM_CONV with 256-thread threadgroups (default 0x7 on GPUs without simdgroup-mm); 0 = old paths
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

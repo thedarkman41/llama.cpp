@@ -10781,6 +10781,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // decode: channel counts that are not a multiple of the 256-thread threadgroup, model shapes
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, 1000, 1, 1}, {4, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3, 1000, 2, 1}, {3, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4, 10240, 1, 1}, {4, 10240, 1, 1}, false));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,  8192, 1, 1}, {4,  8192, 1, 1}, false));
+
     // prefill: partial channel/token tiles and multiple sequences
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {515, 8192, 1, 1}, {4, 8192, 1, 1})); // qwen3.5 moe pp512
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + 100, 1000, 3, 1}, {4, 1000, 1, 1}));
@@ -11653,6 +11659,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // transposed sources, e.g. the delta-net conv input (conv states ++ transposed qkv)
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_concat(type, {3, 8192, 1, 1}, 512, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 10240, 1, 1}, 1, 0, 16)); // one decode token
+        test_cases.emplace_back(new test_concat(type, {1, 100, 3, 2}, 3, 0, 32));
         test_cases.emplace_back(new test_concat(type, {3, 100, 3, 2}, 37, 0, 16));
         test_cases.emplace_back(new test_concat(type, {37, 100, 3, 2}, 3, 0, 32));
         test_cases.emplace_back(new test_concat(type, {33, 64, 1, 1}, 31, 0, 48));

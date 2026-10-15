@@ -4,7 +4,9 @@ constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
 constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
-kernel void kernel_ssm_conv_f32_f32(
+// ROWS: ntg.x channels per threadgroup (one-token decode), else one channel per one-thread threadgroup
+template<bool ROWS>
+kernel void kernel_ssm_conv_f32_f32_impl(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
         device const  void * src1,
@@ -12,9 +14,13 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = ROWS ? (int64_t) tgpig.x*ntg.x + tpitg.x : (int64_t) tgpig.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
+
+    if (ROWS && ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;
@@ -35,7 +41,8 @@ kernel void kernel_ssm_conv_f32_f32(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
-kernel void kernel_ssm_conv_f32_f32_4(
+template<bool ROWS>
+kernel void kernel_ssm_conv_f32_f32_4_impl(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
         device const  void * src1,
@@ -43,9 +50,13 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = ROWS ? (int64_t) tgpig.x*ntg.x + tpitg.x : (int64_t) tgpig.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
+
+    if (ROWS && ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;
@@ -65,6 +76,13 @@ kernel void kernel_ssm_conv_f32_f32_4(
 
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
+
+typedef decltype(kernel_ssm_conv_f32_f32_impl<false>) kernel_ssm_conv_t;
+
+template [[host_name("kernel_ssm_conv_f32_f32")]]        kernel kernel_ssm_conv_t kernel_ssm_conv_f32_f32_impl<false>;
+template [[host_name("kernel_ssm_conv_f32_f32_rows")]]   kernel kernel_ssm_conv_t kernel_ssm_conv_f32_f32_impl<true>;
+template [[host_name("kernel_ssm_conv_f32_f32_4")]]      kernel kernel_ssm_conv_t kernel_ssm_conv_f32_f32_4_impl<false>;
+template [[host_name("kernel_ssm_conv_f32_f32_4_rows")]] kernel kernel_ssm_conv_t kernel_ssm_conv_f32_f32_4_impl<true>;
 
 constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 

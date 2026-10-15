@@ -134,6 +134,7 @@
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
+#define FC_CPY                         2400
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

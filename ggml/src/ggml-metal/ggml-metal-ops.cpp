@@ -575,9 +575,13 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     const bool is_q = ggml_is_quantized(op->type);
 
     // dim-0 concat with a transposed source (e.g. the delta-net conv input): the generic kernel walks
-    // dim 0 of the source with a large stride, so go through a 32x32 tile instead
+    // dim 0 of the source with a large stride, so go through a 32x32 tile instead. GGML_METAL_DN_CONV bit 0: a
+    // transposed source of width 1 (one decode token) has no dim-0 walk, and the tile would idle most of its lanes
+    const bool tr_1 = (ggml_metal_device_get_props(ctx->dev)->dn_conv & 1) != 0;
+    const bool tr   = tr_1 ? ((nb10 > nb11 && ne10 > 1) || (nb00 > nb01 && ne00 > 1)) : (nb10 > nb11 || nb00 > nb01);
+
     if (dim == 0 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
-        nb0 == ggml_type_size(op->type) && ne1 >= 32 && (nb10 > nb11 || nb00 > nb01)) {
+        nb0 == ggml_type_size(op->type) && ne1 >= 32 && tr) {
         ggml_metal_kargs_concat args = {
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
@@ -776,7 +780,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -1831,7 +1835,10 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         const int n_token_batches = (ne1 + BATCH_SIZE - 1) / BATCH_SIZE;
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, n_token_batches, ne02, BATCH_SIZE, 1, 1);
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op, (int32_t) ne10, use_silu);
+        // GGML_METAL_DN_CONV bit 2: one thread per channel in 256-thread threadgroups instead of one-thread threadgroups
+        const bool use_rows = (ggml_metal_device_get_props(ctx->dev)->dn_conv & 4) != 0;
+
+        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op, (int32_t) ne10, use_silu, use_rows);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -1839,7 +1846,13 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        if (use_rows) {
+            const int nth = std::min({256, (int) ne01, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)});
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nth - 1)/nth, ne1, ne02, nth, 1, 1);
+        } else {
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        }
     }
 
     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
@@ -2315,7 +2328,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -2349,7 +2362,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type, false);
 
     GGML_ASSERT(ne10 % ggml_blck_size(op->src[1]->type) == 0);
 
@@ -2424,7 +2437,12 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+    // GGML_METAL_DN_CONV bit 1: 32-bit index math in kernel_cpy_t_t when every element index fits
+    const bool i32 = (ggml_metal_device_get_props(ctx->dev)->dn_conv & 2) &&
+        ggml_blck_size(op->src[0]->type) == 1 && ggml_blck_size(op->type) == 1 &&
+        ggml_nelements(op->src[0]) <= INT32_MAX && ggml_nelements(op) <= INT32_MAX;
+
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, i32);
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 

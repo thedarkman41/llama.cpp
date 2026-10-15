@@ -1346,6 +1346,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_DN_DECODE=%d\n", __func__, dev->props.dn_decode);
                 }
 
+                // decode conv-chain paths (CONCAT, CPY, SSM_CONV): default on GPUs without simdgroup-mm
+                dev->props.dn_conv = getenv("GGML_METAL_DN_CONV") ? (int) strtol(getenv("GGML_METAL_DN_CONV"), NULL, 0) : (dev->props.has_simdgroup_mm ? 0 : 0x7);
+                if (getenv("GGML_METAL_DN_CONV")) {
+                    GGML_LOG_INFO("%s: GGML_METAL_DN_CONV=0x%x\n", __func__, dev->props.dn_conv);
+                }
+
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {

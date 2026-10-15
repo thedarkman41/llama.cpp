@@ -2,6 +2,8 @@
 #include "dequantize.h"
 #include "quantize.h"
 
+constant bool FC_cpy_i32 [[function_constant(FC_CPY + 0)]];
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
@@ -19,12 +21,33 @@ kernel void kernel_cpy_t_t(
         return;
     }
 
-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+    int32_t i3;
+    int32_t i2;
+    int32_t i1;
+    int32_t i0;
 
-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    if (FC_cpy_i32) {
+        // every element index fits in 31 bits (host-checked): unsigned 32-bit index math
+        const uint n_10  = (uint) args.ne1*(uint) args.ne0;
+        const uint n_210 = (uint) args.ne2*n_10;
+
+        const uint n = (((uint) i03*(uint) args.ne02 + (uint) i02)*(uint) args.ne01 + (uint) i01)*(uint) args.ne00;
+
+        const uint r3 = n  - (n /n_210)*n_210;
+        const uint r2 = r3 - (r3/n_10)*n_10;
+
+        i3 = n /n_210;
+        i2 = r3/n_10;
+        i1 = r2/(uint) args.ne0;
+        i0 = r2 - (uint) i1*(uint) args.ne0;
+    } else {
+        const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+
+        i3 = n/(args.ne2*args.ne1*args.ne0);
+        i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+        i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+        i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    }
 
     device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
 

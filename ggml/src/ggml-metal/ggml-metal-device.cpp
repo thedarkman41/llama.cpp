@@ -82,16 +82,23 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst, bool i32) {
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
-    snprintf(name, 256, "%s", base);
+    snprintf(name, 256, "%s_i32=%d", base, i32 ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        // 32-bit index math in kernel_cpy_t_t (ignored by the quantizing copies)
+        ggml_metal_cv_set_bool(cv, i32, FC_CPY + 0);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     return res;
@@ -565,7 +572,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
-        ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
+        ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu, bool rows) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
 
@@ -581,7 +588,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         suffix = "_4";
     }
 
-    snprintf(base, 256, "kernel_ssm_conv_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
+    snprintf(base, 256, "kernel_ssm_conv_%s_%s%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix, rows ? "_rows" : "");
     snprintf(name, 256, "%s_nc=%d_silu=%d", base, nc, use_silu ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
