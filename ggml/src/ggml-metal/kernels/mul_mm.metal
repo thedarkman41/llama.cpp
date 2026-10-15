@@ -11,6 +11,8 @@ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant bool FC_mul_mm_wc_early [[function_constant(FC_MUL_MM + 7)]];
 constant short FC_mul_mm_wc_ks   [[function_constant(FC_MUL_MM + 8)]]; // kernel_mul_mm_wc: K splits (1 = off)
 constant bool  FC_mul_mm_wc_dq2  [[function_constant(FC_MUL_MM + 9)]]; // kernel_mul_mm_wc: dq2 A loaders (mm_wc_dq2_row, mm_wc_dq2_load/_dec)
+constant bool  FC_mul_mm_id_wl_tgg [[function_constant(FC_MUL_MM + 10)]]; // kernel_mul_mm_id_wl dq2: lookup tables in threadgroup memory
+constant bool  FC_mul_mm_id_wl_b16 [[function_constant(FC_MUL_MM + 11)]]; // kernel_mul_mm_id_wl dq2: src1 is a contiguous f16 copy
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -832,7 +834,9 @@ void mm_wc_dq2_load(device const block_iq4_xs * xb, int c, int aks, thread uint 
     r[5] = qb.y;
 }
 
-void mm_wc_dq2_dec(device const block_iq4_xs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+// the lookup table versions (_g) take the table from any address space (kernel_mul_mm_id_wl: threadgroup memory)
+template<typename G>
+void mm_wc_dq2_dec_g(device const block_iq4_xs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, G kvalues) {
     const uint ls0 = ((r[1] >> (8*c    )) & 0xF) | (((r[0] >> (16 + 4*c)) & 3) << 4);
     const uint ls1 = ((r[1] >> (8*c + 4)) & 0xF) | (((r[0] >> (18 + 4*c)) & 3) << 4);
 
@@ -844,9 +848,13 @@ void mm_wc_dq2_dec(device const block_iq4_xs *, const thread uint * r, int c, in
     FOR_UNROLL (int i = 0; i < 4; i++) {
         const uchar4 q  = as_type<uchar4>((r[2 + i] >> sh) & 0x0F0F0F0Fu);
         const float  dl = i < 2 ? dl0 : dl1;
-        v[i] = dl*float4(kvalues_iq4nl_f[q[0]], kvalues_iq4nl_f[q[1]], kvalues_iq4nl_f[q[2]], kvalues_iq4nl_f[q[3]]);
+        v[i] = dl*float4(kvalues[q[0]], kvalues[q[1]], kvalues[q[2]], kvalues[q[3]]);
     }
     sg = 0;
+}
+
+void mm_wc_dq2_dec(device const block_iq4_xs * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, kvalues_iq4nl_f);
 }
 
 // iq3_s chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%4 of iq3s_grid[qs[8*ib + l/4] | bit l/4 of qh[ib] << 8],
@@ -863,7 +871,8 @@ void mm_wc_dq2_load(device const block_iq3_s * xb, int c, int aks, thread uint *
     r[3] = as_type<ushort>(xb->d);
 }
 
-void mm_wc_dq2_dec(device const block_iq3_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+template<typename G>
+void mm_wc_dq2_dec_g(device const block_iq3_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, G grid) {
     const uint qh = r[1];
     const uint sc = r[1] >> (16 + 8*(c%2));
     const uint s  = r[2] >> (8*(aks%2)); // sign byte of sub-block 2*c in bits 0..7, of 2*c + 1 in bits 16..23
@@ -873,11 +882,15 @@ void mm_wc_dq2_dec(device const block_iq3_s *, const thread uint * r, int c, int
     const float dl1 = d*(float) (1 + 2*(int) ((sc >> 4) & 0xF));
 
     FOR_UNROLL (int i = 0; i < 4; i++) {
-        const uint  g  = iq3s_grid[((r[0] >> 8*i) & 0xFF) | (((qh >> (8*(i/2) + 2*aks + i%2)) & 1) << 8)];
+        const uint  g  = grid[((r[0] >> 8*i) & 0xFF) | (((qh >> (8*(i/2) + 2*aks + i%2)) & 1) << 8)];
         const float dl = i < 2 ? dl0 : dl1;
         v[i] = dl*float4(as_type<uchar4>(g));
     }
     sg = (s & 0xFF) | ((s >> 8) & 0xFF00);
+}
+
+void mm_wc_dq2_dec(device const block_iq3_s * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, iq3s_grid);
 }
 
 // iq3_xxs chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%4 of iq3xxs_grid[qs[8*ib + l/4]],
@@ -894,7 +907,8 @@ void mm_wc_dq2_load(device const block_iq3_xxs * xb, int c, int aks, thread uint
     r[3] = as_type<ushort>(xb->d);
 }
 
-void mm_wc_dq2_dec(device const block_iq3_xxs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+template<typename G>
+void mm_wc_dq2_dec_g(device const block_iq3_xxs *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, G grid) {
     const float d = (float) as_type<half>((ushort) r[3]);
 
     sg = 0;
@@ -906,9 +920,13 @@ void mm_wc_dq2_dec(device const block_iq3_xxs *, const thread uint * r, int c, i
         sg |= (s7 | ((popcount(s7) & 1) << 7)) << 8*h; // ksigns_iq2xs[s7]
 
         FOR_UNROLL (int i = 0; i < 2; i++) {
-            v[2*h + i] = dl*float4(as_type<uchar4>(iq3xxs_grid[(r[0] >> (16*h + 8*i)) & 0xFF]));
+            v[2*h + i] = dl*float4(as_type<uchar4>(grid[(r[0] >> (16*h + 8*i)) & 0xFF]));
         }
     }
+}
+
+void mm_wc_dq2_dec(device const block_iq3_xxs * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, iq3xxs_grid);
 }
 
 // iq2_s chunk c: sub-blocks 2*c (k < 32) and 2*c + 1, weight 32*ib + l = byte l%8 of iq2s_grid[qs[4*ib + l/8] | ((qh[ib] >> 2*(l/8)) & 3) << 8],
@@ -925,7 +943,8 @@ void mm_wc_dq2_load(device const block_iq2_s * xb, int c, int aks, thread uint *
     r[3] = as_type<ushort>(xb->d);
 }
 
-void mm_wc_dq2_dec(device const block_iq2_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+template<typename G>
+void mm_wc_dq2_dec_g(device const block_iq2_s *, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, G grid) {
     const float d = (float) as_type<half>((ushort) r[3]);
 
     const uint q = r[0] >> (8*(aks%2));
@@ -933,12 +952,48 @@ void mm_wc_dq2_dec(device const block_iq2_s *, const thread uint * r, int c, int
 
     FOR_UNROLL (int h = 0; h < 2; h++) {
         const float dl = d*(0.5f + (float) ((r[2] >> (16 + 8*h + 4*(aks/2))) & 0xF))*0.25f;
-        const uint2 g  = ((constant uint2 *) iq2s_grid)[((q >> 16*h) & 0xFF) | (((r[2] >> (8*h + 2*aks)) & 3) << 8)];
+        const uint2 g  = grid[((q >> 16*h) & 0xFF) | (((r[2] >> (8*h + 2*aks)) & 3) << 8)];
 
         v[2*h + 0] = dl*float4(as_type<uchar4>(g.x));
         v[2*h + 1] = dl*float4(as_type<uchar4>(g.y));
     }
     sg = (s & 0xFF) | ((s >> 8) & 0xFF00);
+}
+
+void mm_wc_dq2_dec(device const block_iq2_s * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, (constant uint2 *) iq2s_grid);
+}
+
+// kernel_mul_mm_id_wl: lookup tables of the dq2 decoders in threadgroup memory (GGML_METAL_MOE_TGG), as uint words
+template<typename block_q> constexpr int mm_wl_ntab() {
+    return is_same<block_q, block_iq2_s>::value   ? 2*1024 :
+           is_same<block_q, block_iq3_s>::value   ? 512    :
+           is_same<block_q, block_iq3_xxs>::value ? 256    :
+           is_same<block_q, block_iq4_xs>::value  ? 16     : 0;
+}
+
+template<typename block_q>
+uint mm_wl_tab(device const block_q *, int i) { return 0; }
+uint mm_wl_tab(device const block_iq2_s *,   int i) { return ((constant uint *) iq2s_grid)[i]; }
+uint mm_wl_tab(device const block_iq3_s *,   int i) { return iq3s_grid[i]; }
+uint mm_wl_tab(device const block_iq3_xxs *, int i) { return iq3xxs_grid[i]; }
+uint mm_wl_tab(device const block_iq4_xs *,  int i) { return as_type<uint>(kvalues_iq4nl_f[i]); }
+
+template<typename block_q>
+void mm_wl_dec_tab(device const block_q * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, threadgroup const uint * tab) {
+    mm_wc_dq2_dec(xb, r, c, aks, v, sg);
+}
+void mm_wl_dec_tab(device const block_iq2_s * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, threadgroup const uint * tab) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, (threadgroup const uint2 *) tab);
+}
+void mm_wl_dec_tab(device const block_iq3_s * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, threadgroup const uint * tab) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, tab);
+}
+void mm_wl_dec_tab(device const block_iq3_xxs * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, threadgroup const uint * tab) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, tab);
+}
+void mm_wl_dec_tab(device const block_iq4_xs * xb, const thread uint * r, int c, int aks, thread float4 * v, thread uint & sg, threadgroup const uint * tab) {
+    mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, (threadgroup const float *) tab);
 }
 
 // k row in the chunk of the staged A word wa[i]
@@ -1718,16 +1773,149 @@ template [[host_name("kernel_mul_mm_id_map_wl_ne20_10")]] kernel kernel_mul_mm_i
 template [[host_name("kernel_mul_mm_id_map_wl_ne20_16")]] kernel kernel_mul_mm_id_map_wl_t kernel_mul_mm_id_map_wl<16>;
 template [[host_name("kernel_mul_mm_id_map_wl_ne20_22")]] kernel kernel_mul_mm_id_map_wl_t kernel_mul_mm_id_map_wl<22>;
 
+// kernel_mul_mm_id_map_wl with all threads of the threadgroup busy (GGML_METAL_MOE_MAP=1), same outputs:
+// per round of N_MM_ID_MAP_TC tokens, a bitmap bm[e][t/32] of the hits is built with atomic OR (a repeated id of a
+// token sets its bit once), then each bitmap word is emitted in token order with the first matching slot
+template<short ne20> // n_expert_used
+kernel void kernel_mul_mm_id_map_wl2(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device const char * src2,
+        device       char * htpe,
+        device       char * hids,
+        device       char * hwl,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        ushort tpitg [[thread_position_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    constexpr int TC = N_MM_ID_MAP_TC;
+    constexpr int NW = TC/32; // bitmap words per expert
+
+    const int tid  = tpitg;
+    const int nth  = ntg; // >= ne02
+    const int ne02 = args.ne02;
+
+    threadgroup uint     * bm   = (threadgroup uint *) shmem;              // [ne02][NW]
+    threadgroup uint     * nall = bm + ne02*NW;                             // [ne02] hits so far
+    threadgroup uint     * scan = nall + ne02;                              // [ne02] hits of the round, then the item scan
+    threadgroup uchar    * pre  = (threadgroup uchar *) (scan + ne02);      // [ne02][NW] hits of the round before word w
+    threadgroup uint16_t * sids = (threadgroup uint16_t *) (pre + ne02*NW); // [TC][ne20]
+
+    if (tid < ne02) {
+        nall[tid] = 0;
+    }
+
+    for (int i21 = 0; i21 < args.ne21; i21 += TC) {
+        const int nt = min(TC, args.ne21 - i21);
+
+        for (int i = tid; i < ne02*NW; i += nth) {
+            bm[i] = 0;
+        }
+        for (int i = tid; i < nt*ne20; i += nth) {
+            const int t = i/ne20;
+            sids[i] = ((device const int32_t *) (src2 + (uint64_t) (i21 + t)*args.nb21))[i - t*ne20];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = tid; i < nt*ne20; i += nth) {
+            const int e = sids[i];
+            const int t = i/ne20;
+            if (e < ne02) {
+                atomic_fetch_or_explicit((threadgroup atomic_uint *) &bm[e*NW + t/32], 1u << (t%32), memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < ne02) {
+            uint n = 0;
+            FOR_UNROLL (int w = 0; w < NW; w++) {
+                pre[tid*NW + w] = n;
+                n += popcount(bm[tid*NW + w]);
+            }
+            scan[tid] = n;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = tid; i < ne02*NW; i += nth) {
+            const int e = i/NW;
+            const int w = i - e*NW;
+
+            device int32_t * ids_i32 = (device int32_t *) hids + (uint64_t) e*args.ne21 + nall[e] + pre[i];
+
+            uint b = bm[i];
+            for (int j = 0; b != 0; j++) {
+                const int t = 32*w + ctz(b);
+                b &= b - 1;
+
+                int sel = 0;
+                FOR_UNROLL (int i20 = ne20 - 1; i20 >= 0; i20--) {
+                    sel = sids[t*ne20 + i20] == e ? i20 : sel;
+                }
+                ids_i32[j] = (i21 + t)*ne20 + sel;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < ne02) {
+            nall[tid] += scan[tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // inclusive scan of the work item counts over the experts
+    uint32_t nwi = 0;
+    if (tid < ne02) {
+        ((device uint32_t *) htpe)[tid] = nall[tid];
+
+        nwi = (nall[tid] + N_MM_ID_WL_BN - 1)/N_MM_ID_WL_BN;
+        scan[tid] = nwi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int off = 1; off < ne02; off *= 2) {
+        const uint32_t v = tid < ne02 && tid >= off ? scan[tid - off] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < ne02) {
+            scan[tid] += v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < ne02) {
+        device uint32_t * wl = (device uint32_t *) hwl;
+
+        const uint32_t base = scan[tid] - nwi;
+
+        for (uint32_t j = 0; j < nwi; j++) {
+            wl[1 + base + j] = ((uint32_t) tid << 16) | j;
+        }
+
+        if (tid == ne02 - 1) {
+            wl[0] = scan[tid];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_map_wl2<1>) kernel_mul_mm_id_map_wl2_t;
+
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_1" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<1>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_2" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<2>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_4" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<4>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_5" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<5>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_6" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<6>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_8" )]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<8>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_10")]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<10>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_16")]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<16>;
+template [[host_name("kernel_mul_mm_id_map_wl2_ne20_22")]] kernel kernel_mul_mm_id_map_wl2_t kernel_mul_mm_id_map_wl2<22>;
+
 // grouped expert matmul over the work list of kernel_mul_mm_id_map_wl (GGML_METAL_MOE_WL)
 // threadgroup (x, y) = (128 rows, work item = expert e and up to 32 of its tokens), 128 threads = 4 simdgroups
 // each weight is dequantized once per work item. K-major packed half2 words, as kernel_mul_mm_wc:
-//   As[k][w ^ g*RPW]         = (A[w][k], A[w + 64][k]), g = k/16 (swizzle for this staging map)
+//   As[k][w ^ g*RPW]         = (A[w][k], A[w + 64][k]), g = k/16 (swizzle for this staging map; DQ2: g = (k/8)%4)
 //   Bs[kp][n ^ ((kp/4)%4)*8] = (B[n][2kp], B[n][2kp + 1])
 // simdgroup w owns tokens 8w..8w+7 for all 128 rows: it gathers and multiplies them only if the item has any
 template<
     typename T0, typename T0_4x4, typename block_q, short nl,
     void (*dequantize_func)(device const block_q *, short, thread T0_4x4 &),
-    int BK>
+    int BK, bool DQ2 = false>
 kernel void kernel_mul_mm_id_wl(
         constant ggml_metal_kargs_mul_mm_id & args,
         device const char * src0,
@@ -1792,6 +1980,9 @@ kernel void kernel_mul_mm_id_wl(
     const int bn = 8*w + lane/4;
     const int bo = lane%4;
 
+    // DQ2 && FC_mul_mm_id_wl_b16: src1 is the f16 copy of the host (args.nb11, args.nb12 are its strides)
+    const bool b16 = DQ2 && FC_mul_mm_id_wl_b16;
+
     device const float * y = (device const float *) src1;
     if (bn < nt) {
         const int id  = ids[bn];
@@ -1807,23 +1998,97 @@ kernel void kernel_mul_mm_id_wl(
         acc[j][1] = float4(0.0f);
     }
 
+    // DQ2: the dq2 A loaders of kernel_mul_mm_wc (BK = 64 = one chunk): lane ag of a row pair takes k = 8*ag..+7 and
+    // 32 + 8*ag..+7 (mm_wc_ka), the As swizzle key is then (k >> 3) & 3 = ag. QK_K blocks: rows past M read row M - 1 (never stored)
+    constexpr bool dq2    = DQ2;
+    constexpr bool dq2_sp = !is_same<block_q, block_q3_K>::value && !is_same<block_q, block_q4_K>::value;
+
+    static_assert(!DQ2 || (BK == 64 && nl == QK_NL), "dq2 needs BK = 64 and QK_K blocks");
+
+    // lookup table of the decoder after Bs (data-dependent constant memory reads are slow on some GPUs)
+    constexpr int NTAB = mm_wl_ntab<block_q>();
+    const bool tgg = DQ2 && NTAB > 0 && FC_mul_mm_id_wl_tgg;
+
+    threadgroup uint * Ts = Bs + (BK/2)*BN; // [NTAB]
+    if (tgg) {
+        for (int i = tiitg; i < NTAB; i += 4*32) {
+            Ts[i] = mm_wl_tab((device const block_q *) src0, i);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device const block_q * xr[NPA][2];
+    FOR_UNROLL (int p = 0; p < NPA; p++) {
+        const int rp = RPW*(4*p + w) + lane/G;
+        xr[p][0] = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + rp,      M - 1));
+        xr[p][1] = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + rp + 64, M - 1));
+    }
+
     for (int k0 = 0; k0 < K; k0 += BK) {
         uint wa[NPA][16];
-        FOR_UNROLL (int p = 0; p < NPA; p++) {
-            const int rp   = RPW*(4*p + w) + lane/G;
-            const int kpos = k0 + 16*ag;
+        if (dq2 && dq2_sp) {
+            const int c = (k0/64) % 4;
+            uint r[NPA][2][MM_WC_DQ2_NR];
+            FOR_UNROLL (int p = 0; p < NPA; p++) {
+                mm_wc_dq2_load(xr[p][0] + k0/QK_K, c, ag, r[p][0]);
+                mm_wc_dq2_load(xr[p][1] + k0/QK_K, c, ag, r[p][1]);
+            }
+            FOR_UNROLL (int p = 0; p < NPA; p++) {
+                float4 v0[4];
+                float4 v1[4];
+                uint sg0;
+                uint sg1;
+                if (tgg) {
+                    mm_wl_dec_tab(xr[p][0], r[p][0], c, ag, v0, sg0, Ts);
+                    mm_wl_dec_tab(xr[p][1], r[p][1], c, ag, v1, sg1, Ts);
+                } else {
+                    mm_wc_dq2_dec(xr[p][0], r[p][0], c, ag, v0, sg0);
+                    mm_wc_dq2_dec(xr[p][1], r[p][1], c, ag, v1, sg1);
+                }
+                const uint sg = sg0 | (sg1 << 16);
+                FOR_UNROLL (int i = 0; i < 16; i++) {
+                    wa[p][i] = as_type<uint>(half2((half) v0[i/4][i%4], (half) v1[i/4][i%4])) ^ ((sg << (15 - i)) & 0x80008000u);
+                }
+            }
+        } else if (dq2) {
+            const int c = (k0/64) % 4;
+            FOR_UNROLL (int p = 0; p < NPA; p++) {
+                float4 v0[4];
+                float4 v1[4];
+                mm_wc_dq2_row(xr[p][0] + k0/QK_K, c, ag, v0);
+                mm_wc_dq2_row(xr[p][1] + k0/QK_K, c, ag, v1);
+                FOR_UNROLL (int i = 0; i < 16; i++) {
+                    wa[p][i] = as_type<uint>(half2((half) v0[i/4][i%4], (half) v1[i/4][i%4]));
+                }
+            }
+        } else {
+            FOR_UNROLL (int p = 0; p < NPA; p++) {
+                const int rp   = RPW*(4*p + w) + lane/G;
+                const int kpos = k0 + 16*ag;
 
-            const T0_4x4 r0 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + rp,      M, K, kpos);
-            const T0_4x4 r1 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + rp + 64, M, K, kpos);
+                const T0_4x4 r0 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + rp,      M, K, kpos);
+                const T0_4x4 r1 = mm_wc_load_a<T0, T0_4x4, block_q, nl, dequantize_func>(src0, args.nb01, offset0, ra + rp + 64, M, K, kpos);
 
-            FOR_UNROLL (int i = 0; i < 16; i++) {
-                wa[p][i] = as_type<uint>(half2(r0[i/4][i%4], r1[i/4][i%4]));
+                FOR_UNROLL (int i = 0; i < 16; i++) {
+                    wa[p][i] = as_type<uint>(half2(r0[i/4][i%4], r1[i/4][i%4]));
+                }
             }
         }
 
         // zero for tokens past the item
         uint wb[NPB][4];
         FOR_UNROLL (int p = 0; p < NPB; p++) {
+            if (b16) {
+                uint4 u = uint4(0);
+                if (bn < nt) {
+                    u = *((device const uint4 *) ((device const half *) y + k0 + 8*(bo + 4*p)));
+                }
+                wb[p][0] = u.x;
+                wb[p][1] = u.y;
+                wb[p][2] = u.z;
+                wb[p][3] = u.w;
+                continue;
+            }
             float4 x0 = float4(0.0f);
             float4 x1 = float4(0.0f);
             if (bn < nt) {
@@ -1845,9 +2110,9 @@ kernel void kernel_mul_mm_id_wl(
         // every store of a simdgroup hits 32 distinct banks
         FOR_UNROLL (int p = 0; p < NPA; p++) {
             const int rp = RPW*(4*p + w) + lane/G;
-            threadgroup uint * pa = As + 16*ag*NW + (rp ^ (ag*RPW));
+            threadgroup uint * pa = As + (dq2 ? 0 : 16*ag*NW) + (rp ^ (ag*RPW));
             FOR_UNROLL (int i = 0; i < 16; i++) {
-                pa[i*NW] = wa[p][i];
+                pa[(dq2 ? mm_wc_ka(true, ag, i) : i)*NW] = wa[p][i];
             }
         }
         // the B words of a simdgroup are read only by that simdgroup
@@ -1870,7 +2135,7 @@ kernel void kernel_mul_mm_id_wl(
             }
 
             FOR_UNROLL (int kp = 0; kp < BK/2; kp++) {
-                const int xa = (kp/8)*RPW;     // k group of k = 2kp, 2kp + 1
+                const int xa = dq2 ? ((kp/4) % 4)*8 : (kp/8)*RPW; // As swizzle of k = 2kp, 2kp + 1: dq2 k octet, else k group
                 const int xb = ((kp/4) % 4)*8; // k octet of k pair kp
 
                 const uint4 ua0 = *((threadgroup const uint4 *) (As + (2*kp + 0)*NW + ((4*rg) ^ xa)));
@@ -1980,6 +2245,14 @@ template [[host_name("kernel_mul_mm_id_wl_iq1_s_f32_bk64")]]   kernel mul_mm_id_
 template [[host_name("kernel_mul_mm_id_wl_iq1_m_f32_bk64")]]   kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   64>;
 template [[host_name("kernel_mul_mm_id_wl_iq4_nl_f32_bk64")]]  kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq4_nl,  2,     dequantize_iq4_nl,  64>;
 template [[host_name("kernel_mul_mm_id_wl_iq4_xs_f32_bk64")]]  kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  64>;
+
+template [[host_name("kernel_mul_mm_id_wl_dq2_q3_K_f32_bk64")]]    kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_q3_K,    QK_NL, dequantize_q3_K,    64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_q4_K_f32_bk64")]]    kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_q4_K,    QK_NL, dequantize_q4_K,    64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_q6_K_f32_bk64")]]    kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_q6_K,    QK_NL, dequantize_q6_K,    64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_iq4_xs_f32_bk64")]]  kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq4_xs,  QK_NL, dequantize_iq4_xs,  64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_iq3_s_f32_bk64")]]   kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq3_s,   QK_NL, dequantize_iq3_s,   64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_iq3_xxs_f32_bk64")]] kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, 64, true>;
+template [[host_name("kernel_mul_mm_id_wl_dq2_iq2_s_f32_bk64")]]   kernel mul_mm_id_wl_t kernel_mul_mm_id_wl<half, half4x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   64, true>;
 
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(

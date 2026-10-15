@@ -1584,16 +1584,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_tiled(
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl(ggml_metal_library_t lib, int ne02, int ne20, bool v2) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_map_wl_ne20_%d", ne20);
+    snprintf(base, 256, "kernel_mul_mm_id_map_wl%s_ne20_%d", v2 ? "2" : "", ne20);
     snprintf(name, 256, "%s_ne02=%d", base, ne02);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    if (v2) {
+        // must match kernel_mul_mm_id_map_wl2: bitmap [ne02][TC/32] uint, hit counts and scan [ne02] uint each,
+        // word prefixes [ne02][TC/32] uchar, routing ids [TC][ne20] ushort
+        const size_t nw = N_MM_ID_MAP_TC/32;
+
+        res.smem = GGML_PAD((size_t) ne02*nw*sizeof(uint32_t) + 2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*nw +
+                (size_t) N_MM_ID_MAP_TC*ne20*sizeof(uint16_t), 16);
+
+        return res;
     }
 
     // routing ids [ne02][ne20] ushort, then the scan [ne02] uint in the same space
@@ -1605,23 +1616,46 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl(ggml_metal_library_t lib, const ggml_tensor * op, int bk) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl(ggml_metal_library_t lib, const ggml_tensor * op, int bk, bool dq2, bool b16) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_wl_%s_%s_bk%d", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), bk);
-    snprintf(name, 256, "%s", base);
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    // decoder lookup table in threadgroup memory (dq2 kernels only), uint words: must match mm_wl_ntab (mul_mm.metal)
+    int ntab = 0;
+    if (dq2 && props->moe_tgg) {
+        switch (op->src[0]->type) {
+            case GGML_TYPE_IQ2_S:   ntab = 2*1024; break;
+            case GGML_TYPE_IQ3_S:   ntab = 512;    break;
+            case GGML_TYPE_IQ3_XXS: ntab = 256;    break;
+            case GGML_TYPE_IQ4_XS:  ntab = 16;     break;
+            default:                               break;
+        }
+    }
+
+    snprintf(base, 256, "kernel_mul_mm_id_wl_%s%s_%s_bk%d", dq2 ? "dq2_" : "", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), bk);
+    GGML_ASSERT(dq2 || !b16);
+
+    snprintf(name, 256, "%s_tgg=%d_b16=%d", base, ntab > 0, b16);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, ntab > 0, FC_MUL_MM + 10);
+        ggml_metal_cv_set_bool(cv, b16,      FC_MUL_MM + 11);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
-    // must match kernel_mul_mm_id_wl (mul_mm.metal): 4 simdgroups, As[BK][BM/2] + Bs[BK/2][BN] packed half2 words
+    // must match kernel_mul_mm_id_wl (mul_mm.metal): 4 simdgroups, As[BK][BM/2] + Bs[BK/2][BN] packed half2 words + the table
     res.nr0  = N_MM_ID_WL_BM;
     res.nr1  = N_MM_ID_WL_BN;
     res.nsg  = 4;
-    res.smem = (size_t) (bk*(N_MM_ID_WL_BM/2) + (bk/2)*N_MM_ID_WL_BN)*sizeof(uint32_t);
+    res.smem = (size_t) (bk*(N_MM_ID_WL_BM/2) + (bk/2)*N_MM_ID_WL_BN + ntab)*sizeof(uint32_t);
 
     return res;
 }

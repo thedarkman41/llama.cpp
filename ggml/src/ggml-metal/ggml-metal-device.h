@@ -151,8 +151,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_tiled   (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl  (ggml_metal_library_t lib, int ne02, int ne20);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl      (ggml_metal_library_t lib, const struct ggml_tensor * op, int bk);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map_wl  (ggml_metal_library_t lib, int ne02, int ne20, bool v2);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_wl      (ggml_metal_library_t lib, const struct ggml_tensor * op, int bk, bool dq2, bool b16);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -327,6 +327,10 @@ struct ggml_metal_device_props {
 
     int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
     int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)
+    int moe_map;    // GGML_METAL_MOE_MAP: 1 = kernel_mul_mm_id_map_wl2 (default), 0 = kernel_mul_mm_id_map_wl
+    int moe_dq2;    // GGML_METAL_MOE_DQ2: bitmask of the dq2 A loaders in kernel_mul_mm_id_wl (BK = 64), bits as mm_dq2 (default 0x7f); 0 = dequantize_* loaders
+    int moe_b16;    // GGML_METAL_MOE_B16: 1 = the dq2 kernels read a contiguous f16 copy of src1 (default), 0 = src1
+    int moe_tgg;    // GGML_METAL_MOE_TGG: 1 = dq2 decoder lookup tables (iq2_s, iq3_s, iq3_xxs, iq4_xs) in threadgroup memory (default), 0 = constant memory
 
     int topk_moe;   // GGML_METAL_TOPK_MOE: 0 = kernel_topk_moe_f32, 1 = kernel_topk_moe_f32_nd, 2 = _nd with simd_max/simd_min select (default without simdgroup-mm)
 

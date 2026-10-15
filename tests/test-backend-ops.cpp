@@ -5561,6 +5561,70 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MUL_MAT_ID with skewed routing, as real routers do: a few experts get many tokens (several token blocks each), many get none
+struct test_mul_mat_id_skew : public test_mul_mat_id {
+    const double skew; // weight of the expert of rank r: exp(-r/skew)
+
+    test_mul_mat_id_skew(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, double skew)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), skew(skew) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",skew=" + std::to_string(skew);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+
+        std::default_random_engine rng(1234 + n);
+        std::vector<int> rank(n_mats);
+        for (int e = 0; e < n_mats; e++) {
+            rank[e] = e;
+        }
+        std::shuffle(rank.begin(), rank.end(), rng);
+
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                // n_used distinct experts drawn by weight, then the unused ones
+                std::vector<double> w(n_mats);
+                for (int e = 0; e < n_mats; e++) {
+                    w[e] = std::exp(-rank[e]/skew);
+                }
+                std::vector<int32_t> data;
+                std::vector<bool> used(n_mats, false);
+                for (int i = 0; i < n_used; i++) {
+                    double sum = 0.0;
+                    for (int e = 0; e < n_mats; e++) {
+                        sum += used[e] ? 0.0 : w[e];
+                    }
+                    double x = u(rng)*sum;
+                    int sel = -1;
+                    for (int e = 0; e < n_mats; e++) {
+                        if (!used[e]) {
+                            sel = e;
+                            x -= w[e];
+                            if (x <= 0.0) {
+                                break;
+                            }
+                        }
+                    }
+                    used[sel] = true;
+                    data.push_back(sel);
+                }
+                for (int e = 0; e < n_mats && (int64_t) data.size() < t->ne[0]; e++) {
+                    if (!used[e]) {
+                        data.push_back(e);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -11025,6 +11089,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,  GGML_TYPE_F32,   2, 1, false, 128, 1000,  256));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,  GGML_TYPE_F32,   1, 1, false, 128,   33,  256));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 256, 8, true,   64,  512, 2048));
+    // grouped MoE matmul with skewed routing (empty experts, experts with many token blocks): the dq2 loader types and two others,
+    // real 256-expert shapes, odd m (row tail), one QK_K block or an odd block count, few tokens, and more tokens than one map round
+    for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XS}) {
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 256, 8, true,   512,  512, 2048, 16.0));
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 256, 8, false, 2048,  512,  512, 16.0));
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a,  64, 6, false,  130,  300,  768,  4.0));
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a,  32, 4, true,  1001,   40,  256,  2.0));
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 128, 2, false,  192, 1500,  512,  1.0));
+    }
+    // many experts: map_wl2 needs 36 KB / 49 KB of threadgroup memory here, so these run map_wl2 or the map_wl fallback
+    // depending on the device limit (GGML_METAL_MOE_MAP=0 forces map_wl)
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ3_S, 512, 22, false, 128, 600, 256, 64.0));
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ2_S, 1024, 1, true,  64, 2000, 256,  8.0));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));

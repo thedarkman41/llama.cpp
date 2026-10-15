@@ -1309,6 +1309,21 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MOE_WL=%d GGML_METAL_MOE_WL_MIN=%d\n", __func__, dev->props.moe_wl, dev->props.moe_wl_min);
                 }
 
+                // MoE routing pass of kernel_mul_mm_id_wl: 1 = kernel_mul_mm_id_map_wl2 (default), 0 = kernel_mul_mm_id_map_wl
+                dev->props.moe_map = getenv("GGML_METAL_MOE_MAP") ? atoi(getenv("GGML_METAL_MOE_MAP")) : 1;
+                if (dev->props.moe_map != 1) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MOE_MAP=%d\n", __func__, dev->props.moe_map);
+                }
+
+                // kernel_mul_mm_id_wl dq2 A loaders (BK = 64), bits as GGML_METAL_MM_DQ2
+                dev->props.moe_dq2 = getenv("GGML_METAL_MOE_DQ2") ? (int) strtol(getenv("GGML_METAL_MOE_DQ2"), NULL, 0) : 0x7f;
+                dev->props.moe_tgg = getenv("GGML_METAL_MOE_TGG") ? atoi(getenv("GGML_METAL_MOE_TGG")) : 1;
+                dev->props.moe_b16 = getenv("GGML_METAL_MOE_B16") ? atoi(getenv("GGML_METAL_MOE_B16")) : 1;
+                if (dev->props.moe_dq2 != 0x7f || dev->props.moe_tgg != 1 || dev->props.moe_b16 != 1) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MOE_DQ2=0x%x GGML_METAL_MOE_TGG=%d GGML_METAL_MOE_B16=%d\n", __func__,
+                            dev->props.moe_dq2, dev->props.moe_tgg, dev->props.moe_b16);
+                }
+
                 // fused MoE router: register-only kernel with the simd_max/simd_min select on GPUs without simdgroup-mm
                 dev->props.topk_moe = getenv("GGML_METAL_TOPK_MOE") ? atoi(getenv("GGML_METAL_TOPK_MOE"))
                                                                     : (dev->props.has_simdgroup_mm ? 0 : 2);
