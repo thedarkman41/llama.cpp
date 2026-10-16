@@ -3230,6 +3230,139 @@ kernel void kernel_mul_mv_iq3_s_f32(
     kernel_mul_mv_iq3_s_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// v2.1 (dense, non-split): lane = (block, 32-weight sub-block), rows by byte stride with a compile-time nr0, fixed field offsets.
+// LDS grid bytes are g + 16 (g odd, 1..15); a set sign bit XORs the byte with 0x1E: (g + 16) ^ 0x1E = 16 - g. so each byte is
+// 16 + signed weight and is converted unsigned; the -16 comes from the y sums. blocks are 110 B (2-byte aligned): byte and ushort loads
+template<int nr0, typename args_t>
+void kernel_mul_mv_iq3_s_f32_impl_v21(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg_,
+        ushort sgitg_) {
+    const int NSG   = FC_mul_mv_nsg;
+    const int tiisg = tiisg_;
+    const int sgitg = sgitg_;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // clamp to the last nr0 rows so the row tail stays inside src0 (see kernel_mul_mv_iq4_xs_f32_impl_v2)
+    const int first_row = min((r0*NSG + sgitg)*nr0, max(args.ne01 - nr0, 0));
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const uchar * x = (device const uchar *) (src0 + offset0);
+    device const float * y = (device const float *) (src1 + offset1);
+
+    // grid + 16 in each byte (512 x 4 B), then the sign masks: entry n has 0x1E in byte j if bit j of n is set (16 x 4 B)
+    threadgroup uint * sgrid = (threadgroup uint *) shmem;
+    threadgroup uint * ssgn  = sgrid + 512;
+    for (int i = 32*sgitg + tiisg; i < 512; i += 32*NSG) {
+        sgrid[i] = iq3s_grid[i] | 0x10101010u;
+    }
+    if (sgitg == 0 && tiisg < 16) {
+        ssgn[tiisg] = (((uint) tiisg*0x00204081u) & 0x01010101u)*0x1Eu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ix = tiisg/8; // block 0..3 of each group of 4
+    const int ib = tiisg%8; // 32-weight sub-block
+
+    // lane field offsets in the group: d +0, qs +2+8*ib, qh +66+ib, signs +74+4*ib, scales +106+ib/2 (block ix)
+    const int ob = ix*(int) sizeof(block_iq3_s);
+    const int oq = ob +   2 + 8*ib;
+    const int oh = ob +  66 + ib;
+    const int os = ob +  74 + 4*ib;
+    const int oc = ob + 106 + ib/2;
+    const int cs = 4*(ib%2);
+
+    device const float4 * y4 = (device const float4 *) (y + ix*QK_K + 32*ib);
+
+    float sumf[nr0] = {0.f};
+
+    for (int ib0 = 0; ib0 < nb; ib0 += 4) {
+        if (ib0 + ix < nb) {
+            float4 yl[8];
+            FOR_UNROLL (int i = 0; i < 8; ++i) {
+                yl[i] = y4[i];
+            }
+            const float4 t4 = ((yl[0] + yl[1]) + (yl[2] + yl[3])) + ((yl[4] + yl[5]) + (yl[6] + yl[7]));
+            const float sy = 16.f*((t4[0] + t4[1]) + (t4[2] + t4[3]));
+
+            device const uchar * xg = x + ib0*(int) sizeof(block_iq3_s);
+
+            FOR_UNROLL (int row = 0; row < nr0; ++row) {
+                device const uchar * xr = xg + row*args.nb01;
+
+                const uint  h  = xr[oh];
+                const uint  sc = xr[oc];
+                const float d  = (float) *((device const half *) (xr + ob)) * (float) (1 + 2*((sc >> cs) & 0xF));
+
+                // bit 8*l + j = sign of weight 8*l + j
+                const uint s = (uint) *((device const ushort *) (xr + os)) | ((uint) *((device const ushort *) (xr + os + 2)) << 16);
+
+                uint q[8];
+                FOR_UNROLL (int k = 0; k < 4; ++k) {
+                    const uint w = *((device const ushort *) (xr + oq + 2*k));
+                    q[2*k + 0] = w & 0xFF;
+                    q[2*k + 1] = w >> 8;
+                }
+
+                // one fma chain: faster than float4 or two accumulators here
+                float acc = -sy;
+                FOR_UNROLL (int k = 0; k < 8; ++k) {
+                    const uint   g = sgrid[q[k] | ((h << (8 - k)) & 256u)] ^ ssgn[(s >> 4*k) & 0xF];
+                    const float4 f = float4(as_type<uchar4>(g));
+                    acc = fma(yl[k][0], f[0], acc);
+                    acc = fma(yl[k][1], f[1], acc);
+                    acc = fma(yl[k][2], f[2], acc);
+                    acc = fma(yl[k][3], f[3], acc);
+                }
+                sumf[row] = fma(d, acc, sumf[row]);
+            }
+        }
+
+        y4 += QK_K;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_iq3_s_f32_v2")]]
+kernel void kernel_mul_mv_iq3_s_f32_v2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (FC_mul_mv_nr0 == N_R0_IQ3_S_V21) {
+        kernel_mul_mv_iq3_s_f32_impl_v21<N_R0_IQ3_S_V21, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_iq3_s_f32_impl_v21<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_iq2_s_f32_impl(
         args_t args,

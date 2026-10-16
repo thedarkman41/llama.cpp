@@ -10928,6 +10928,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 1, 1024, {3, 2}, {2, 1}));
     }
+    // Metal iq3_s v2.1 mat-vec (non-split k): row tails (nr0 = 4; m < 4 takes nr0 = 1, not tested here, see the m = 3 note below), row strides of an odd block count (k_v), strided batches (m_v), a batch stride that is 2 mod 4 (pad = 3 blocks)
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{5, 768}, {6, 1024}, {9, 5120}, {513, 768}, {2049, 1280}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32,   37, 1, 1280, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1792));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003, 330));
     // Metal v2 mat-vec bodies through mul_mv_id: decode shapes, split and non-split k
     for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 512, 1, 2048));
@@ -12557,6 +12565,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {6144, 5120}}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
         }
+    }
+    // qwen3.8-27B UD iq3_s decode shapes, and smaller m
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 5120}, {12288, 5120}, {5120, 6144}, {2048, 5120}, {1024, 5120}, {512, 5120}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // output head
     // qwen3.8-27B q5_K decode shapes

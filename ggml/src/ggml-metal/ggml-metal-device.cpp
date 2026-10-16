@@ -1393,6 +1393,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr0 = N_R0_IQ3_S_SPLIT;
                     split = true;
                 }
+
+                // v2.1 body (kernel_mul_mv_iq3_s_f32_v2): byte and ushort loads, so 2-byte aligned blocks only; float4 loads of src1. it takes nr0 from FC_mul_mv_nr0
+                const ggml_tensor * t = op->src[0];
+                const ggml_tensor * u = op->src[1];
+                if (use_v2(9) && !split && ((uintptr_t) t->data | t->nb[1] | t->nb[2] | t->nb[3]) % 2 == 0 &&
+                                           ((uintptr_t) u->data | u->nb[1] | u->nb[2] | u->nb[3]) % 16 == 0) {
+                    v2     = true;
+                    nr0    = ne01 >= N_R0_IQ3_S_V21 ? N_R0_IQ3_S_V21 : 1;
+                    suffix = "_v2";
+                    smem   = 512*4 + 16*4;
+                }
             } break;
         case GGML_TYPE_IQ2_S:
             {
