@@ -1327,8 +1327,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q6_K:
             {
+                v2  = use_v2(7);
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+                if (v2) {
+                    // v2 takes nr0 from FC_mul_mv_nr0
+                    nr0 = ne01 >= 512 ? N_R0_Q6_K_V2 : 1;
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {

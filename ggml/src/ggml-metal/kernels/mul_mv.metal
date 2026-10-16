@@ -2158,6 +2158,141 @@ void kernel_mul_mv_q6_K_f32_impl(
     }
 }
 
+// v2: lane = (block, 128-weight half, 8 positions), all 4 fields of the 8 positions (32 weights): ql bytes 64*ih + 8*il + [0, 8)
+// (fields 0, 2) and + 32 (fields 1, 3), qh bytes 32*ih + 8*il + [0, 8). blocks are 210 B (2-byte aligned), so ushort loads
+// combined into uints. the 6-bit u = q + 32 is built 4 at a time and converted with byte converts; the -32 comes from the y sums
+static inline float mv_v2_q6_K_row(
+        device const uint16_t * ql, // ql + 64*ih + 8*il
+        device const uint16_t * qh, // qh + 32*ih + 8*il
+        device const uint16_t * sc, // scales + 8*ih
+        device const half     * dh,
+        thread const float4   * yl,
+        thread const float    * sy, // 32*sum(y) of each field
+        int ssh) {                  // 8*(il/2): the scales of the lane are bytes il/2, il/2 + 2, + 4, + 6 of the half
+    const uint a0 = (uint) ql[ 0] | ((uint) ql[ 1] << 16);
+    const uint a1 = (uint) ql[ 2] | ((uint) ql[ 3] << 16);
+    const uint b0 = (uint) ql[16] | ((uint) ql[17] << 16);
+    const uint b1 = (uint) ql[18] | ((uint) ql[19] << 16);
+    const uint h0 = (uint) qh[ 0] | ((uint) qh[ 1] << 16);
+    const uint h1 = (uint) qh[ 2] | ((uint) qh[ 3] << 16);
+
+    // scales of fields 0, 1 in bytes 0, 2 of s01, of fields 2, 3 in bytes 0, 2 of s23
+    const uint s01 = ((uint) sc[0] | ((uint) sc[1] << 16)) >> ssh;
+    const uint s23 = ((uint) sc[2] | ((uint) sc[3] << 16)) >> ssh;
+
+    uint u[2][4];
+    FOR_UNROLL (int k = 0; k < 2; ++k) {
+        const uint a = k == 0 ? a0 : a1;
+        const uint b = k == 0 ? b0 : b1;
+        const uint h = k == 0 ? h0 : h1;
+        u[k][0] = ( a       & 0x0F0F0F0Fu) | ((h << 4) & 0x30303030u);
+        u[k][1] = ( b       & 0x0F0F0F0Fu) | ((h << 2) & 0x30303030u);
+        u[k][2] = ((a >> 4) & 0x0F0F0F0Fu) | ( h       & 0x30303030u);
+        u[k][3] = ((b >> 4) & 0x0F0F0F0Fu) | ((h >> 2) & 0x30303030u);
+    }
+
+    float dj[4];
+    FOR_UNROLL (int j = 0; j < 4; ++j) {
+        const float4 f0 = float4(as_type<uchar4>(u[0][j]));
+        const float4 f1 = float4(as_type<uchar4>(u[1][j]));
+        float acc = -sy[j];
+        acc = fma(yl[2*j + 0][0], f0[0], acc);
+        acc = fma(yl[2*j + 0][1], f0[1], acc);
+        acc = fma(yl[2*j + 0][2], f0[2], acc);
+        acc = fma(yl[2*j + 0][3], f0[3], acc);
+        acc = fma(yl[2*j + 1][0], f1[0], acc);
+        acc = fma(yl[2*j + 1][1], f1[1], acc);
+        acc = fma(yl[2*j + 1][2], f1[2], acc);
+        acc = fma(yl[2*j + 1][3], f1[3], acc);
+        dj[j] = acc;
+    }
+
+    const float4 s = float4(as_type<char4>(s01)[0], as_type<char4>(s01)[2], as_type<char4>(s23)[0], as_type<char4>(s23)[2]);
+
+    return (float) dh[0] * ((s[0]*dj[0] + s[1]*dj[1]) + (s[2]*dj[2] + s[3]*dj[3]));
+}
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_q6_K_f32_impl_v2(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg_,
+        ushort sgitg_) {
+    const int NSG   = FC_mul_mv_nsg;
+    const int tiisg = tiisg_;
+    const int sgitg = sgitg_;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // clamp to the last nr0 rows so the row tail stays inside src0 (see kernel_mul_mv_iq4_xs_f32_impl_v2)
+    const int first_row = min((r0*NSG + sgitg)*nr0, max(args.ne01 - nr0, 0));
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+    device const float      * y = (device const float      *) (src1 + offset1);
+
+    const int ix = tiisg/8;     // block 0..3
+    const int ih = (tiisg/4)%2; // 128-weight half
+    const int il = tiisg%4;     // positions 8*il .. 8*il + 7 of the half
+
+    // lane weights: 128*ih + 32*j + 8*il + [0, 8) for field j = 0..3, scale 8*ih + 2*j + il/2
+    const int ssh = 8*(il/2);
+
+    device const float4 * y4 = (device const float4 *) (y + ix*QK_K + 128*ih + 8*il);
+
+    float sumf[nr0] = {0.f};
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 yl[8];
+        float  sy[4];
+        FOR_UNROLL (int j = 0; j < 4; ++j) {
+            yl[2*j + 0] = y4[8*j + 0];
+            yl[2*j + 1] = y4[8*j + 1];
+            const float4 t = yl[2*j + 0] + yl[2*j + 1];
+            sy[j] = 32.f*((t[0] + t[1]) + (t[2] + t[3]));
+        }
+
+        // rows are args.nb01 bytes apart (even): 2-byte loads only
+        device const uint16_t * ql = (device const uint16_t *) (x[ib].ql + 64*ih + 8*il);
+        device const uint16_t * qh = (device const uint16_t *) (x[ib].qh + 32*ih + 8*il);
+        device const uint16_t * sc = (device const uint16_t *) (x[ib].scales + 8*ih);
+        device const half     * dh = &x[ib].d;
+
+        FOR_UNROLL (int row = 0; row < nr0; ++row) {
+            sumf[row] += mv_v2_q6_K_row(ql, qh, sc, dh, yl, sy, ssh);
+
+            ql += args.nb01/2;
+            qh += args.nb01/2;
+            sc += args.nb01/2;
+            dh += args.nb01/2;
+        }
+
+        y4 += QK_K;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
 [[host_name("kernel_mul_mv_q6_K_f32")]]
 kernel void kernel_mul_mv_q6_K_f32(
         constant ggml_metal_kargs_mul_mv & args,
@@ -2168,7 +2303,15 @@ kernel void kernel_mul_mv_q6_K_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    if (FC_mul_mv_v2) {
+        if (FC_mul_mv_nr0 == N_R0_Q6_K_V2) {
+            kernel_mul_mv_q6_K_f32_impl_v2<N_R0_Q6_K_V2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+        } else {
+            kernel_mul_mv_q6_K_f32_impl_v2<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+        }
+    } else {
+        kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    }
 }
 
 // ======================= "True" 2-bit
