@@ -1324,6 +1324,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 v2  = use_v2(4);
                 nsg = N_SG_Q5_K;
                 nr0 = v2 ? N_R0_Q5_K_V2 : N_R0_Q5_K;
+
+                // v2.1 body (kernel_mul_mv_q5_K_f32_v2): uint4/uint2 loads, so 16-byte aligned blocks only. it takes nr0 from FC_mul_mv_nr0
+                const ggml_tensor * t = op->src[0];
+                if (use_v2(8) && ((uintptr_t) t->data | t->nb[1] | t->nb[2] | t->nb[3]) % 16 == 0) {
+                    v2     = true;
+                    nr0    = ne01 >= 512 ? N_R0_Q5_K_V21 : 1;
+                    suffix = "_v2";
+                }
             } break;
         case GGML_TYPE_Q6_K:
             {

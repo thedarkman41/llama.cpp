@@ -106,6 +106,7 @@
 #define N_R0_Q3_K_V2   4 // for ne01 >= 2048, see ggml_metal_library_get_pipeline_mul_mv
 #define N_R0_Q4_K_V2   2 // for ne01 > 1024
 #define N_R0_Q6_K_V2   2 // for ne01 >= 512
+#define N_R0_Q5_K_V21  2 // v2.1 body, for ne01 >= 512
 
 #define N_R0_TQ2_0 4
 #define N_SG_TQ2_0 2

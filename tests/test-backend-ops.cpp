@@ -10935,8 +10935,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 1001, 1, 2048)); // row tail
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false,   37, 1, 512));
     }
-    // Metal v2 q3_K / q4_K / q6_K mat-vec: every nr0 (q3_K 1, 2, 4; q4_K, q6_K 1, 2), odd m for the row tail, odd superblock count, broadcast
-    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+    // Metal v2 q3_K / q4_K / q5_K / q6_K mat-vec: every nr0 (q3_K 1, 2, 4; q4_K, q5_K, q6_K 1, 2), odd m for the row tail, odd superblock count, broadcast
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (int64_t m : {5, 29, 37, 512, 513, 1001, 1002, 2047, 2049, 2051, 4100}) { // not m = 3: with 3 outputs the CPU's q8_K rounding of y alone exceeds the NMSE bound ~1% of the time
             for (int64_t k : {256, 768, 2048, 5120}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
@@ -10945,8 +10945,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   64, 1, 1024, {3, 2}, {2, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2050, 1,  768, {3, 2}, {2, 1}));
     }
-    // Metal v2 q6_K mat-vec: row strides of an odd block count (k_v), strided batches (m_v)
-    for (ggml_type type_a : {GGML_TYPE_Q6_K}) {
+    // Metal v2 q5_K / q6_K mat-vec: row strides of an odd block count (k_v), strided batches (m_v)
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   37, 1, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 768));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, 1, 512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, 1, 512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
@@ -12559,6 +12559,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // output head
+    // qwen3.8-27B q5_K decode shapes
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}, {1024, 5120}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
     // qwen3.8-27B Q3_K_M decode shapes
     for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 6144}, {6144, 5120}, {12288, 5120}, {1024, 5120}, {48, 5120}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));

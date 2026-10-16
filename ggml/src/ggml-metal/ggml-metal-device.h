@@ -323,7 +323,7 @@ struct ggml_metal_device_props {
     int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
     int mm_dq2; // GGML_METAL_MM_DQ2: bitmask of the kernel_mul_mm_wc dq2 A loaders: bit 0 q3_K, 1 q4_K, 2 q6_K, 3 iq4_xs, 4 iq3_s, 5 iq3_xxs, 6 iq2_s (default 0x7f); 0 = dequantize_* loaders
 
-    int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K (5, 6, 7 dense only); 0 = old kernels
+    int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K, 8 q5_K v2.1 (5-8 dense only; 8 overrides 4); 0 = old kernels
 
     int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
     int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)
