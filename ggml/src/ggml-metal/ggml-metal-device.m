@@ -1724,8 +1724,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 }
 
                 // v2 mat-vec bodies (FC_mul_mv_v2), only used on GPUs without simdgroup-mm
-                dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x3ff;
-                if (dev->props.mv_v2 != 0x3ff) {
+                dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x7ff;
+                if (dev->props.mv_v2 != 0x7ff) {
                     GGML_LOG_INFO("%s: GGML_METAL_MV_V2=0x%x\n", __func__, dev->props.mv_v2);
                 }
 

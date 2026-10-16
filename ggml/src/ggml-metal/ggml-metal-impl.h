@@ -108,6 +108,7 @@
 #define N_R0_Q6_K_V2   2 // for ne01 >= 512
 #define N_R0_Q5_K_V21  2 // v2.1 body, for ne01 >= 512
 #define N_R0_IQ3_S_V21 4 // v2.1 body, for ne01 >= 4
+#define N_R0_IQ3_XXS_V21 4 // v2.1 body, for ne01 >= 4
 
 #define N_R0_TQ2_0 4
 #define N_SG_TQ2_0 2
