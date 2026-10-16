@@ -2739,12 +2739,104 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+// most src1 rows staged by kernel_mul_mv_f16_f32_gqa per threadgroup, and its largest row (ng*ne00 floats <= 16 KB)
+#define GGML_METAL_MV_GQA_NG     8
+#define GGML_METAL_MV_GQA_NE00 512
+
+// f16 x f32 mat-vec with short rows and one src1 row per batch (decode KQ at head dim <= 512, KQV at n_kv <= 512):
+// kernel_mul_mv_f16_f32_gqa reads each src0 row once for the r2 src1 batches of its GQA group and uses all lanes
+static bool ggml_metal_op_mul_mat_use_gqa(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    if (props->mv_gqa <= 0 || src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t ne00 = src0->ne[0];
+
+    if (ne00 % 4 != 0 || ne00 < 32 || ne00 > GGML_METAL_MV_GQA_NE00 || src1->ne[1] != 1 ||
+        src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] != src0->ne[3] || src1->ne[2]/src0->ne[2] > INT16_MAX) {
+        return false;
+    }
+
+    // element-contiguous rows: half4 loads of src0, float4 loads of src1, contiguous dst
+    if (src0->nb[0] != sizeof(ggml_fp16_t) || src1->nb[0] != sizeof(float) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    const uint64_t offs0 = ggml_metal_get_buffer_id(src0).offs;
+    const uint64_t offs1 = ggml_metal_get_buffer_id(src1).offs;
+
+    return (offs0 | src0->nb[1] | src0->nb[2] | src0->nb[3]) % 8 == 0 &&
+           (offs1 | src1->nb[2] | src1->nb[3]) % 16 == 0;
+}
+
+static int ggml_metal_op_mul_mat_mv_gqa(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_gqa(lib, op);
+
+    const int r2  = ne12/ne02;
+    const int ng  = std::min(r2, GGML_METAL_MV_GQA_NG);
+    const int nch = (r2 + ng - 1)/ng;
+    const int nsg = pipeline.nsg;
+
+    // rows per threadgroup: 4*nsg per pass. long src0 batches (deep KV) take up to 8 passes so the grid stays near
+    // 128 threadgroups: each one stages its src1 rows once (5700 XT, ne01 = 8448: 107 -> 95 us at r2 = 6, 74 -> 57 us at 8)
+    const int nblk  = (ne01 + 4*nsg - 1)/(4*nsg);
+    const int ntg1  = nblk*ne02*nch*ne03;
+    const int npass = std::max(1, std::min(8, ntg1/128));
+
+    ggml_metal_kargs_mul_mv_gqa args = {
+        /*.ne00  =*/ ne00,
+        /*.ne01  =*/ ne01,
+        /*.nb01  =*/ nb01,
+        /*.nb02  =*/ nb02,
+        /*.nb03  =*/ nb03,
+        /*.ne12  =*/ ne12,
+        /*.nb12  =*/ nb12,
+        /*.nb13  =*/ nb13,
+        /*.ne0   =*/ ne0,
+        /*.ne1   =*/ ne1,
+        /*.r2    =*/ (int16_t) r2,
+        /*.ng    =*/ (int16_t) ng,
+        /*.nch   =*/ (int16_t) nch,
+        /*.npass =*/ (int16_t) npass,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (size_t) ng*ne00*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nblk + npass - 1)/npass, ne02*nch, ne03, 32, nsg, 1);
+
+    return 1;
+}
+
 // the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
 static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
+
+    if (ggml_metal_op_mul_mat_use_gqa(op, ggml_metal_device_get_props(ctx->dev))) {
+        return ggml_metal_op_mul_mat_mv_gqa(ctx, idx);
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);

@@ -146,6 +146,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc_ksum    (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mm_cvt_f32_f16    (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gqa        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
@@ -322,6 +323,8 @@ struct ggml_metal_device_props {
 
     int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
     int mm_dq2; // GGML_METAL_MM_DQ2: bitmask of the kernel_mul_mm_wc dq2 A loaders: bit 0 q3_K, 1 q4_K, 2 q6_K, 3 iq4_xs, 4 iq3_s, 5 iq3_xxs, 6 iq2_s (default 0x7f); 0 = dequantize_* loaders
+
+    int mv_gqa; // GGML_METAL_MV_GQA: 1 = f16 x f32 mat-vecs with ne00 <= 512 and one src1 row per batch (decode KQ/KQV) read each src0 row once for its r2 src1 batches (kernel_mul_mv_f16_f32_gqa; default on GPUs without simdgroup-mm), 0 = off
 
     int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K, 8 q5_K v2.1, 9 iq3_s v2.1, 10 iq3_xxs v2.1 (5-10 dense only; 8 overrides 4, 9 and 10 override 0 and 1 except in split mode); 0 = old kernels
 

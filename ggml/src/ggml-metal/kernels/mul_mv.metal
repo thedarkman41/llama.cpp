@@ -1194,6 +1194,100 @@ template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_m
 template [[host_name("kernel_mul_mv_f32_bf16_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float,  float4,  bfloat, bfloat4>;
 #endif
 
+// short-row mat-vec (ne00 <= 512, one src1 row per batch) that reads each src0 row once for the ng src1 batches that
+// share its batch (GQA: decode KQ at head dim 256, KQV at short context). 8 lanes per row, 4 rows per simdgroup pass;
+// the ng src1 rows are staged in threadgroup memory. grid: (row blocks, src0 batch * nch, ne03), r3 == 1
+template<typename T04>
+kernel void kernel_mul_mv_t_f32_gqa(
+        constant ggml_metal_kargs_mul_mv_gqa & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    constexpr short NG = 8; // most src1 rows per threadgroup
+    constexpr short NU = 4; // staging loads in flight per thread
+
+    const int ne00_4 = args.ne00/4;
+
+    const int i02 = tgpig.y/args.nch;
+    const int ich = tgpig.y%args.nch;
+    const int i03 = tgpig.z;
+
+    const int h0  = i02*args.r2 + ich*args.ng;
+    const int ngc = min((int) args.ng, (int) args.r2 - ich*args.ng);
+
+    threadgroup float4 * ysh = (threadgroup float4 *) shmem;
+
+    const int nth = 32*nsg;
+    const int ny4 = ngc*ne00_4;
+
+    for (int i0 = 0; i0 < ny4; i0 += NU*nth) {
+        float4 t[NU];
+
+        FOR_UNROLL (short u = 0; u < NU; ++u) {
+            const int i = i0 + u*nth + tiitg;
+            const int g = i/ne00_4;
+            if (i < ny4) {
+                t[u] = *((device const float4 *) (src1 + (uint64_t)(h0 + g)*args.nb12 + (uint64_t)i03*args.nb13) + (i - g*ne00_4));
+            }
+        }
+
+        FOR_UNROLL (short u = 0; u < NU; ++u) {
+            const int i = i0 + u*nth + tiitg;
+            if (i < ny4) {
+                ysh[i] = t[u];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short j = tiisg%8;
+
+    for (int ip = 0; ip < args.npass; ++ip) {
+        const int r = (tgpig.x*args.npass + ip)*4*nsg + sgitg*4 + tiisg/8;
+
+        device const T04 * x4 = (device const T04 *) (src0 + (uint64_t) min(r, args.ne01 - 1)*args.nb01 + (uint64_t)i02*args.nb02 + (uint64_t)i03*args.nb03);
+
+        float acc[NG] = { 0.f };
+
+        for (int k = j; k < ne00_4; k += 8) {
+            const float4 x = float4(x4[k]);
+
+            FOR_UNROLL (short g = 0; g < NG; ++g) {
+                if (g < ngc) {
+                    acc[g] += dot(x, ysh[g*ne00_4 + k]);
+                }
+            }
+        }
+
+        float v = 0.f;
+
+        FOR_UNROLL (short g = 0; g < NG; ++g) {
+            acc[g] += simd_shuffle_xor(acc[g], 4);
+            acc[g] += simd_shuffle_xor(acc[g], 2);
+            acc[g] += simd_shuffle_xor(acc[g], 1);
+
+            v = g == j ? acc[g] : v;
+        }
+
+        if (r < args.ne01 && j < ngc) {
+            device float * dst_f32 = (device float *) dst + ((uint64_t)i03*args.ne12 + h0 + j)*args.ne0*args.ne1;
+
+            dst_f32[r] = v;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_t_f32_gqa<half4>) mul_mv_t_f32_gqa_t;
+
+template [[host_name("kernel_mul_mv_f16_f32_gqa")]] kernel mul_mv_t_f32_gqa_t kernel_mul_mv_t_f32_gqa<half4>;
+
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
         args_t args,

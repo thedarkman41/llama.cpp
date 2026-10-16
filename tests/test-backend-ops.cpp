@@ -11207,6 +11207,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    // Metal kernel_mul_mv_f16_f32_gqa: decode KQ (K cache view) at GQA ratios 6 and 8, 12 (two src1 chunks) with ne03 = 2,
+    // row tails; KQV (V^T view, rows strided by the cache size) at n_kv <= 512, and at 516 / 2052 (not taken)
+    for (int64_t m : {256, 257, 1000}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, 256, {4, 1}, {6,  1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, 256, {2, 1}, {8,  1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, 128, {1, 2}, {12, 1}, {0, 2, 1, 3}));
+    }
+    // deep KV: several 32-row passes per threadgroup, the last threadgroup partly past the rows
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4100, 1, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8191, 1, 256, {2, 1}, {8, 1}, {0, 2, 1, 3}));
+    for (int64_t k : {36, 256, 512, 516, 2052}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 1, k, {4, 1}, {6, 1}, {0, 1, 2, 3}, 2*k + 64));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
@@ -12516,6 +12529,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F32,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F16,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_BF16, {7680, 192, 1, 1}));
+
+    // decode attention without flash attention at head dim 256 (27B: 4 kv heads x 6, 35B: 2 x 8): KQ and KQV at n_kv 256 and 8448
+    for (auto bn : {std::array<int64_t, 2>{4, 6}, std::array<int64_t, 2>{2, 8}}) {
+        for (int64_t n_kv : {256, 8448}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, n_kv, 1, 256, {bn[0], 1}, {bn[1], 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 1, n_kv, {bn[0], 1}, {bn[1], 1}, {0, 1, 2, 3}, 2*n_kv));
+        }
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));

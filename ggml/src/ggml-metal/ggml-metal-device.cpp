@@ -1509,6 +1509,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gqa(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32);
+
+    const char * name = "kernel_mul_mv_f16_f32_gqa";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    // 8 simdgroups of 4-row passes; the threadgroup memory (ng src1 rows) is set by the encoder
+    res.nr0 = 4;
+    res.nr1 = 1;
+    res.nsg = 8;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib) {
     char base[256];
     char name[256];

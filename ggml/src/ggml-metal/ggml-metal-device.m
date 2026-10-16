@@ -1723,6 +1723,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
                 }
 
+                // short-row f16 mat-vecs that share src0 rows across the GQA src1 batches: default on GPUs without simdgroup-mm
+                dev->props.mv_gqa = getenv("GGML_METAL_MV_GQA") ? atoi(getenv("GGML_METAL_MV_GQA")) : (dev->props.has_simdgroup_mm ? 0 : 1);
+                if (getenv("GGML_METAL_MV_GQA")) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MV_GQA=%d\n", __func__, dev->props.mv_gqa);
+                }
+
                 // v2 mat-vec bodies (FC_mul_mv_v2), only used on GPUs without simdgroup-mm
                 dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x7ff;
                 if (dev->props.mv_v2 != 0x7ff) {

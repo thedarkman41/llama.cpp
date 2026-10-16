@@ -553,6 +553,24 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
 
+// kernel_mul_mv_f16_f32_gqa: one src1 row per batch, the r2 src1 batches that share a src0 batch in one threadgroup
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne12;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int16_t  r2;    // src1 batches per src0 batch
+    int16_t  ng;    // src1 batches per threadgroup (<= 8)
+    int16_t  nch;   // threadgroups per src0 batch along the src1 batches: ceil(r2/ng)
+    int16_t  npass; // 4-row passes per simdgroup
+} ggml_metal_kargs_mul_mv_gqa;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
