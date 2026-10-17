@@ -1723,9 +1723,18 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
                 }
 
-                // short-row f16 mat-vecs that share src0 rows across the GQA src1 batches: default on GPUs without simdgroup-mm
-                dev->props.mv_gqa = getenv("GGML_METAL_MV_GQA") ? atoi(getenv("GGML_METAL_MV_GQA")) : (dev->props.has_simdgroup_mm ? 0 : 1);
+                // f16 mat-vecs that share src0 rows across the GQA src1 batches (bit 0 short rows, bit 1 long rows): default on GPUs without simdgroup-mm.
+                // GGML_METAL_MV_GQA is read as decimal or 0x hex (no octal): a value < 0 or a non-number turns both off (as before
+                // the bitmask), bits above 1 are ignored; anything outside 0..3 is reported
+                dev->props.mv_gqa = dev->props.has_simdgroup_mm ? 0 : 3;
                 if (getenv("GGML_METAL_MV_GQA")) {
+                    const char * s = getenv("GGML_METAL_MV_GQA");
+                    char * end = NULL;
+                    const long v = strtol(s, &end, s[0] == '0' && (s[1] == 'x' || s[1] == 'X') ? 16 : 10);
+                    dev->props.mv_gqa = end == s || v < 0 ? 0 : (int) (v & 3);
+                    if (end == s || *end != '\0' || v < 0 || v > 3) {
+                        GGML_LOG_WARN("%s: GGML_METAL_MV_GQA=%s is not a bitmask in 0..3 (decimal or 0x hex), using %d\n", __func__, s, dev->props.mv_gqa);
+                    }
                     GGML_LOG_INFO("%s: GGML_METAL_MV_GQA=%d\n", __func__, dev->props.mv_gqa);
                 }
 

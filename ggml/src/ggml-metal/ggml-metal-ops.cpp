@@ -2743,33 +2743,46 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
 #define GGML_METAL_MV_GQA_NG     8
 #define GGML_METAL_MV_GQA_NE00 512
 
-// f16 x f32 mat-vec with short rows and one src1 row per batch (decode KQ at head dim <= 512, KQV at n_kv <= 512):
-// kernel_mul_mv_f16_f32_gqa reads each src0 row once for the r2 src1 batches of its GQA group and uses all lanes
-static bool ggml_metal_op_mul_mat_use_gqa(const ggml_tensor * op, const ggml_metal_device_props * props) {
+// f16 x f32 mat-vec with one src1 row per batch whose src1 batches share src0 batches (GQA decode KQ and KQV): which
+// kernel reads each src0 row once for the r2 src1 batches of its group and uses all lanes
+//   1: kernel_mul_mv_f16_f32_gqa      (ne00 <= 512: KQ at head dim <= 512, KQV at n_kv <= 512; GGML_METAL_MV_GQA bit 0)
+//   2: kernel_mul_mv_f16_f32_gqa_long (ne00 > 512, r2 >= 2: KQV at n_kv > 512; GGML_METAL_MV_GQA bit 1)
+//   0: neither (kernel_mul_mv_f16_f32_4 / _f16_f32)
+static int ggml_metal_op_mul_mat_gqa_mode(const ggml_tensor * op, const ggml_metal_device_props * props) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
-    if (props->mv_gqa <= 0 || src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
-        return false;
+    if (props->mv_gqa == 0 || src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return 0;
     }
 
     const int64_t ne00 = src0->ne[0];
 
-    if (ne00 % 4 != 0 || ne00 < 32 || ne00 > GGML_METAL_MV_GQA_NE00 || src1->ne[1] != 1 ||
+    if (ne00 % 4 != 0 || ne00 < 32 || src1->ne[1] != 1 ||
         src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] != src0->ne[3] || src1->ne[2]/src0->ne[2] > INT16_MAX) {
-        return false;
+        return 0;
+    }
+
+    const int mode = ne00 <= GGML_METAL_MV_GQA_NE00 ? 1 : 2;
+
+    if ((props->mv_gqa & mode) == 0 || (mode == 2 && src1->ne[2]/src0->ne[2] < 2)) {
+        return 0;
     }
 
     // element-contiguous rows: half4 loads of src0, float4 loads of src1, contiguous dst
     if (src0->nb[0] != sizeof(ggml_fp16_t) || src1->nb[0] != sizeof(float) || !ggml_is_contiguous(op)) {
-        return false;
+        return 0;
     }
 
     const uint64_t offs0 = ggml_metal_get_buffer_id(src0).offs;
     const uint64_t offs1 = ggml_metal_get_buffer_id(src1).offs;
 
-    return (offs0 | src0->nb[1] | src0->nb[2] | src0->nb[3]) % 8 == 0 &&
-           (offs1 | src1->nb[2] | src1->nb[3]) % 16 == 0;
+    if ((offs0 | src0->nb[1] | src0->nb[2] | src0->nb[3]) % 8 != 0 ||
+        (offs1 | src1->nb[2] | src1->nb[3]) % 16 != 0) {
+        return 0;
+    }
+
+    return mode;
 }
 
 static int ggml_metal_op_mul_mat_mv_gqa(ggml_metal_op_t ctx, int idx) {
@@ -2827,6 +2840,69 @@ static int ggml_metal_op_mul_mat_mv_gqa(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// returns 1, or 0 with nothing encoded if no kernel_mul_mv_f16_f32_gqa_long variant fits the device
+static int ggml_metal_op_mul_mat_mv_gqa_long(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+
+    const int r2  = ne12/ne02;
+    const int ng  = std::min(r2, GGML_METAL_MV_GQA_NG);
+    const int nch = (r2 + ng - 1)/ng;
+
+    // 4 rows per threadgroup: each src1 row is read once per 4 src0 rows. 5700 XT, KQV at n_kv 8448 / 16896, 2 kv heads x 8
+    // (4 x 6): 56 / 92 us (89 / 150 us); 2 rows 72 / 134 (108 / 191); 8 rows (~200 VGPRs) 63 / 107 (110 / 178)
+    int nr0 = 4;
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_gqa_long(lib, op, nr0);
+
+    // fewer rows if the pipeline cannot hold the 4 simdgroups (register use); if not even 1 row fits, nothing is
+    // encoded and the caller takes the generic path (same arithmetic)
+    while (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 32*pipeline.nsg) {
+        if (nr0 == 1) {
+            return 0;
+        }
+        nr0 /= 2;
+        pipeline = ggml_metal_library_get_pipeline_mul_mv_gqa_long(lib, op, nr0);
+    }
+
+    ggml_metal_kargs_mul_mv_gqa args = {
+        /*.ne00  =*/ ne00,
+        /*.ne01  =*/ ne01,
+        /*.nb01  =*/ nb01,
+        /*.nb02  =*/ nb02,
+        /*.nb03  =*/ nb03,
+        /*.ne12  =*/ ne12,
+        /*.nb12  =*/ nb12,
+        /*.nb13  =*/ nb13,
+        /*.ne0   =*/ ne0,
+        /*.ne1   =*/ ne1,
+        /*.r2    =*/ (int16_t) r2,
+        /*.ng    =*/ (int16_t) ng,
+        /*.nch   =*/ (int16_t) nch,
+        /*.npass =*/ 1,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/nr0, ne02*nch, ne03, 32, pipeline.nsg, 1);
+
+    return 1;
+}
+
 // the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
 static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -2834,8 +2910,17 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    if (ggml_metal_op_mul_mat_use_gqa(op, ggml_metal_device_get_props(ctx->dev))) {
-        return ggml_metal_op_mul_mat_mv_gqa(ctx, idx);
+    switch (ggml_metal_op_mul_mat_gqa_mode(op, ggml_metal_device_get_props(ctx->dev))) {
+        case 1: return ggml_metal_op_mul_mat_mv_gqa(ctx, idx);
+        case 2:
+            {
+                // 0: no pipeline variant fits the device, use the generic path below
+                const int n_fuse = ggml_metal_op_mul_mat_mv_gqa_long(ctx, idx);
+                if (n_fuse > 0) {
+                    return n_fuse;
+                }
+            } break;
+        default: break;
     }
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
