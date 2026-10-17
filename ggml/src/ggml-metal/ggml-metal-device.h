@@ -323,6 +323,7 @@ struct ggml_metal_device_props {
 
     int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
     int mm_dq2; // GGML_METAL_MM_DQ2: bitmask of the kernel_mul_mm_wc dq2 A loaders: bit 0 q3_K, 1 q4_K, 2 q6_K, 3 iq4_xs, 4 iq3_s, 5 iq3_xxs, 6 iq2_s, 7 f16, 8 f32 (default 0xff, f32 opt-in); 0 = dequantize_* loaders
+    int mm_b16_mintiles; // GGML_METAL_MM_B16_MINTILES: the tiled mul_mm converts a contiguous f32 src1 to f16 first only with at least this many M tiles or an f32 src0 (default 3); 0 = always
 
     int mv_gqa; // GGML_METAL_MV_GQA: 1 = f16 x f32 mat-vecs with ne00 <= 512 and one src1 row per batch (decode KQ/KQV) read each src0 row once for its r2 src1 batches (kernel_mul_mv_f16_f32_gqa; default on GPUs without simdgroup-mm), 0 = off
 
