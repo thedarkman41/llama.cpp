@@ -13,6 +13,7 @@
 #include <cassert>
 #include <algorithm>
 #include <limits>
+#include <atomic>
 #include <cmath>
 
 // threadgroups needed to fill the GPU
@@ -3199,16 +3200,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         int ks = ggml_metal_op_mul_mat_ks(op, props_dev);
 
         // dq2 A loaders of kernel_mul_mm_wc (GGML_METAL_MM_DQ2): q4_K reads the 16-byte block header as one uint4, iq4_xs reads uint2s,
-        // the others read ushorts
+        // the others read ushorts. f16 and f32 read raw 16-byte row segments of whole 64-wide chunks
         const uint64_t al0 = ggml_metal_get_buffer_id(op->src[0]).offs | nb01 | nb02 | nb03;
         const bool dq2 =
-            (op->src[0]->type == GGML_TYPE_Q3_K    && (props_dev->mm_dq2 & 0x01) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_Q4_K    && (props_dev->mm_dq2 & 0x02) && al0 % 16 == 0) ||
-            (op->src[0]->type == GGML_TYPE_Q6_K    && (props_dev->mm_dq2 & 0x04) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_IQ4_XS  && (props_dev->mm_dq2 & 0x08) && al0 % 8  == 0) ||
-            (op->src[0]->type == GGML_TYPE_IQ3_S   && (props_dev->mm_dq2 & 0x10) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_IQ3_XXS && (props_dev->mm_dq2 & 0x20) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_IQ2_S   && (props_dev->mm_dq2 & 0x40) && al0 % 2  == 0);
+            (op->src[0]->type == GGML_TYPE_Q3_K    && (props_dev->mm_dq2 & 0x01)  && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_Q4_K    && (props_dev->mm_dq2 & 0x02)  && al0 % 16 == 0) ||
+            (op->src[0]->type == GGML_TYPE_Q6_K    && (props_dev->mm_dq2 & 0x04)  && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ4_XS  && (props_dev->mm_dq2 & 0x08)  && al0 % 8  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ3_S   && (props_dev->mm_dq2 & 0x10)  && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ3_XXS && (props_dev->mm_dq2 & 0x20)  && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_IQ2_S   && (props_dev->mm_dq2 & 0x40)  && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_F16     && (props_dev->mm_dq2 & 0x80)  && al0 % 16 == 0 && ne00 % 64 == 0) ||
+            (op->src[0]->type == GGML_TYPE_F32     && (props_dev->mm_dq2 & 0x100) && al0 % 16 == 0 && ne00 % 64 == 0);
 
         // kernel_mul_mm_wc by default (GGML_METAL_MM_WC=0 selects kernel_mul_mm_tiled): same tile, grid and f16 scratch
         auto pipeline = props_dev->mm_wc > 0
@@ -3217,6 +3220,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         if (props_dev->mm_wc > 0 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 32*pipeline.nsg) {
             // cannot launch 256 threads: keep the baseline
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("%s: kernel_mul_mm_wc (%s, dq2 = %d) cannot launch %d threads, using kernel_mul_mm_tiled\n", __func__,
+                        ggml_type_name(op->src[0]->type), dq2, 32*pipeline.nsg);
+            }
             pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
             ks = 1;
         }

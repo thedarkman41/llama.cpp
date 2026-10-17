@@ -7715,6 +7715,130 @@ struct test_mul_mat_pos : public test_mul_mat {
     }
 };
 
+// attention without flash attention, as llm_graph_context::build_attn_mha builds it on the KV cache views of
+// llama_kv_cache::get_k / get_v (f16 K/V):
+//   ATTN_MM_KQ:       kq  = mul_mat(k, q), k [hd, n_kv, n_head_kv, ns] with rows n_embd_k_gqa apart, q a permuted f32 view
+//   ATTN_MM_KQV:      kqv = mul_mat(v, kq), v the V^T view (v_trans) [n_kv, hd, n_head_kv, ns] with rows kv_size apart
+//   ATTN_MM_KQV_CONT: kqv = mul_mat(cont(transpose(v)), kq), v not transposed in the cache (-fa auto without flash attention)
+// with the GQA broadcast n_head/n_head_kv and ns streams (non-unified KV cache, 4D views). kq (src1 of kqv) is softmax-like:
+// uniform in [0, 2/n_kv], or with subnormal uniform in [1e-7, 1e-4] (mostly f16 subnormals)
+enum attn_mm_mode {
+    ATTN_MM_KQ,
+    ATTN_MM_KQV,
+    ATTN_MM_KQV_CONT,
+};
+
+static std::string var_to_str(attn_mm_mode mode) {
+    switch (mode) {
+        case ATTN_MM_KQ:       return "kq";
+        case ATTN_MM_KQV:      return "kqv";
+        case ATTN_MM_KQV_CONT: return "kqv_cont";
+    }
+    return "unknown";
+}
+
+struct test_mul_mat_attn : public test_case {
+    const attn_mm_mode mode;
+    const int64_t hd;        // head dim
+    const int64_t n_head;    // q heads
+    const int64_t n_head_kv; // kv heads
+    const int64_t n_kv;
+    const int64_t kv_size;   // cache size >= n_kv
+    const int64_t n_tokens;  // per stream
+    const int64_t ns;        // streams
+    const bool    subnormal;
+
+    std::string vars() override {
+        return VARS_TO_STR9(mode, hd, n_head, n_head_kv, n_kv, kv_size, n_tokens, ns, subnormal);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*n_kv*n_tokens*hd*n_head*ns;
+    }
+
+    test_mul_mat_attn(attn_mm_mode mode = ATTN_MM_KQ, int64_t hd = 256, int64_t n_head = 16, int64_t n_head_kv = 2,
+            int64_t n_kv = 512, int64_t kv_size = 512, int64_t n_tokens = 512, int64_t ns = 1, bool subnormal = false)
+        : mode(mode), hd(hd), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), kv_size(kv_size), n_tokens(n_tokens), ns(ns),
+          subnormal(subnormal) {
+        GGML_ASSERT(kv_size >= n_kv && n_head % n_head_kv == 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd_gqa = hd*n_head_kv;
+
+        ggml_tensor * out;
+        if (mode == ATTN_MM_KQ) {
+            ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_gqa, kv_size, ns);
+            ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, n_head, n_tokens*ns);
+            ggml_set_name(k_cache, "k_cache");
+            ggml_set_name(q, "q");
+
+            ggml_tensor * k = ggml_view_4d(ctx, k_cache, hd, n_head_kv, n_kv, ns,
+                    ggml_row_size(GGML_TYPE_F16, hd),
+                    ggml_row_size(GGML_TYPE_F16, n_embd_gqa),
+                    ggml_row_size(GGML_TYPE_F16, n_embd_gqa*kv_size), 0);
+            q = ggml_view_4d(ctx, q, hd, n_head, n_tokens, ns, q->nb[1], q->nb[2], q->nb[2]*n_tokens, 0);
+
+            q = ggml_permute(ctx, q, 0, 2, 1, 3);
+            k = ggml_permute(ctx, k, 0, 2, 1, 3);
+
+            out = ggml_mul_mat(ctx, k, q);
+        } else {
+            ggml_tensor * kq = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens, n_head, ns);
+            ggml_set_name(kq, "kq");
+
+            ggml_tensor * v;
+            if (mode == ATTN_MM_KQV) {
+                ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kv_size, n_embd_gqa, ns);
+                ggml_set_name(v_cache, "v_cache");
+                v = ggml_view_4d(ctx, v_cache, n_kv, n_head_kv, hd, ns,
+                        ggml_row_size(GGML_TYPE_F16, kv_size*hd),
+                        ggml_row_size(GGML_TYPE_F16, kv_size),
+                        ggml_row_size(GGML_TYPE_F16, kv_size*n_embd_gqa), 0);
+                v = ggml_permute(ctx, v, 0, 2, 1, 3);
+            } else {
+                ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_gqa, kv_size, ns);
+                ggml_set_name(v_cache, "v_cache");
+                v = ggml_view_4d(ctx, v_cache, hd, n_head_kv, n_kv, ns,
+                        ggml_row_size(GGML_TYPE_F16, hd),
+                        ggml_row_size(GGML_TYPE_F16, n_embd_gqa),
+                        ggml_row_size(GGML_TYPE_F16, n_embd_gqa*kv_size), 0);
+                v = ggml_permute(ctx, v, 0, 2, 1, 3);
+                v = ggml_cont(ctx, ggml_transpose(ctx, v));
+            }
+
+            out = ggml_mul_mat(ctx, v, kq);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kq") == 0) {
+                if (subnormal) {
+                    init_tensor_uniform(t, 1e-7f, 1e-4f);
+                } else {
+                    init_tensor_uniform(t, 0.0f, 2.0f/n_kv);
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 enum mul_mat_add_mode {
     MUL_MAT_ADD_MM_RES,     // mm + res
     MUL_MAT_ADD_RES_MM,     // res + mm
@@ -10990,6 +11114,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 33, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
     }
 
+    // Metal kernel_mul_mm_wc raw f16 / f32 A loaders (dq2 map): the attention mat-muls without flash attention at head dim
+    // 256 of the 35B (16 q / 2 kv heads) and the 27Bs (24 / 4): KQ with a permuted f32 q, KQV with the V^T view (rows kv_size
+    // apart, kv_size > n_kv: non-contiguous rows) and with cont(transpose(v)); n_kv not a multiple of 128 (M tail of KQ),
+    // few tokens (speculative decoding: permuted f32 B at n = 9..31), two streams (4D views), a softmax-like B in the f16
+    // subnormal range
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        for (int64_t n_tok : {9, 16, 31, 512}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,  256, nh, nhkv, 1280, 1280, n_tok));
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, 1280, 1536, n_tok));
+        }
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv,  256,  512, 509));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 4100, 4352, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 8448, 8448, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv,  512,  512, 509));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 8448, 8704, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV_CONT, 256, nh, nhkv, 4096, 4352, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 1024, 1280, 256, 2));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 1024, 1280, 256, 2));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 4096, 4096, 512, 1, true));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV_CONT, 256, nh, nhkv, 2048, 2048, 512, 1, true));
+    }
+    // generic f16 / f32 shapes of the raw loaders: K = 64 (one chunk), K tails (k % 64 != 0: the guarded loaders), row strides
+    // that are 8- but not 16-byte aligned (k_v = k + 4) or only 2-byte aligned (k_v = k + 1): the guarded loaders, M tails
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t n : {9, 100, 512}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{191, 256}, {4100, 64}, {4100, 256}, {1000, 2051}, {130, 4100}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1028));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1025));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, n, 768, {2, 2}, {2, 1}, {0, 2, 1, 3}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  256, 512,  2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 14336, {1, 1}, {1, 1}));
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
@@ -12540,6 +12700,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // prefill attention without flash attention (ub 512) at head dim 256 (35B: 16 q / 2 kv heads, 27B: 24 / 4): KQ and KQV
+    // at n_kv = kv_size 8192 / 16384 (power-of-two row strides) and 8448 / 16896
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        for (int64_t n_kv : {8192, 8448, 16384, 16896}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,  256, nh, nhkv, n_kv, n_kv, 512));
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, n_kv, n_kv, 512));
+        }
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

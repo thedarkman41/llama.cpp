@@ -1717,9 +1717,11 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_WC=%d\n", __func__, dev->props.mm_wc);
                 }
 
-                // kernel_mul_mm_wc dq2 A loaders (FC_mul_mm_wc_dq2) for q3_K, q4_K, q6_K, iq4_xs, iq3_s, iq3_xxs, iq2_s, only used on GPUs without simdgroup-mm
-                dev->props.mm_dq2 = getenv("GGML_METAL_MM_DQ2") ? (int) strtol(getenv("GGML_METAL_MM_DQ2"), NULL, 0) : 0x7f;
-                if (dev->props.mm_dq2 != 0x7f) {
+                // kernel_mul_mm_wc dq2 A loaders (FC_mul_mm_wc_dq2) for q3_K, q4_K, q6_K, iq4_xs, iq3_s, iq3_xxs, iq2_s and the raw f16
+                // (0x80) and f32 (0x100) rows, only used on GPUs without simdgroup-mm. 0x7f restores the guarded f16 loader. The f32
+                // one is opt-in: faster on small f32 grids (M = 256 K = 2048 N = 512 1.11x), slower on large ones (8192x512x512 0.85x)
+                dev->props.mm_dq2 = getenv("GGML_METAL_MM_DQ2") ? (int) strtol(getenv("GGML_METAL_MM_DQ2"), NULL, 0) : 0xff;
+                if (dev->props.mm_dq2 != 0xff) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
                 }
 
