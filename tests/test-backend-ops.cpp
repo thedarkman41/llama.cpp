@@ -7963,6 +7963,47 @@ struct test_mul_mat_a_view : public test_case {
     }
 };
 
+// mul_mat with src1 a contiguous view at an offset of offs floats into a larger tensor (Metal: the tiled GEMM reads such
+// an f32 src1 with float4 loads only when it starts 16-byte aligned, otherwise it reads an f16 copy)
+struct test_mul_mat_b_offs : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t offs;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, offs);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_b_offs(ggml_type type_a = GGML_TYPE_F16, int64_t m = 256, int64_t n = 512, int64_t k = 1024, int64_t offs = 1)
+        : type_a(type_a), m(m), n(n), k(k), offs(offs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * bb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k*n + offs);
+        ggml_set_name(a,  "a");
+        ggml_set_name(bb, "b_base");
+
+        ggml_tensor * b = ggml_view_2d(ctx, bb, k, n, k*ggml_type_size(GGML_TYPE_F32), offs*ggml_type_size(GGML_TYPE_F32));
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 enum mul_mat_add_mode {
     MUL_MAT_ADD_MM_RES,     // mm + res
     MUL_MAT_ADD_RES_MM,     // res + mm
@@ -11298,6 +11339,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 100, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1026));
     }
 
+    // Metal tiled GEMM with at most 2 M tiles and a contiguous f32 src1 (GGML_METAL_MM_B16_MINTILES): the GEMM reads the f32
+    // B itself (no f16 copy) unless src0 is f32: split-K (ks 2..8), M tails, odd N/K, src1 views at 16-byte aligned and
+    // 4- / 8-byte aligned offsets (the latter take the f16 copy)
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (auto mnk : std::vector<std::array<int64_t, 3>>{{256, 512, 4096}, {256, 33, 4096}, {256, 509, 1280}, {48, 512, 5120}, {200, 100, 768}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 300, 1024, {3, 2}, {2, 1}));
+        for (int64_t offs : {1, 2, 4}) {
+            test_cases.emplace_back(new test_mul_mat_b_offs(type_a, 256, 512, 1024, offs));
+            test_cases.emplace_back(new test_mul_mat_b_offs(type_a, 512, 512, 1024, offs));
+        }
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
@@ -12862,6 +12917,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // tiled GEMMs with at most 2 M tiles in the prefill (ub 512): the 35B MoE router (f32, M = 256) and delta-net projection
+    // (f32, M = 32), the 27B q8_0 M = 48 projection, KQV at short context
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 256, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,  32, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  48, 512, 5120, {1, 1}, {1, 1}));
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        for (int64_t n_kv : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, n_kv, n_kv, 512));
+        }
+    }
 
     // prefill attention without flash attention (ub 512) at head dim 256 (35B: 16 q / 2 kv heads, 27B: 24 / 4): KQ and KQV
     // at n_kv = kv_size 8192 / 16384 (power-of-two row strides) and 8448 / 16896
