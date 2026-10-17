@@ -10970,6 +10970,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, 1, 512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, 1, 512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
     }
+    // Metal small batches (ne11 = 4..8) of q3_K, q4_K and q5_K on GPUs without simdgroup-mm take the n = 1 mat-vec once
+    // per src1 column (GGML_METAL_MV_EXT_K; q6_K stays on kernel_mul_mv_ext and is the control): every nr0 of the v2
+    // bodies (m 37, 48, 513, 1001, 2049), odd superblock counts, broadcast batches, padded rows (non-contiguous src1),
+    // strided batches, the generic shape
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n = 4; n <= 8; ++n) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{37, 1280}, {48, 5120}, {513, 768}, {1001, 2048}, {2049, 5120}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   64, n, 1024, {3, 2}, {2, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, n,  512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 768));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, n,  512, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
+        }
+        for (int64_t n : {4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
+        }
+    }
     // Metal kernel_mul_mm_wc dq2 loaders (q3_K, q4_K, q6_K, iq4_xs, iq3_s, iq3_xxs, iq2_s): odd m (row tails; m = 48
     // and 4 < 64 at n = 512, m = 4 clamps all but 4 tile rows), odd superblock count, a single block (k = 256), every
     // tile width, split-K starting inside a block (m = 129, 256 and 1001 at small n; m = 129 k = 1280 splits K in 4

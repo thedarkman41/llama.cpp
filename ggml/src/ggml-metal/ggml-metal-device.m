@@ -1735,6 +1735,12 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MV_V2=0x%x\n", __func__, dev->props.mv_v2);
                 }
 
+                // K-quants still allowed on kernel_mul_mv_ext at ne11 = 4..8 on GPUs without simdgroup-mm (bits as GGML_METAL_MV_V2: 4 q5_K, 5 q3_K, 6 q4_K, 7 q6_K)
+                dev->props.mv_ext_k = getenv("GGML_METAL_MV_EXT_K") ? (int) strtol(getenv("GGML_METAL_MV_EXT_K"), NULL, 0) : 0x80;
+                if (dev->props.mv_ext_k != 0x80) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MV_EXT_K=0x%x\n", __func__, dev->props.mv_ext_k);
+                }
+
                 // grouped MoE matmul for prefill: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
                 // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert (and n_tokens >= 32), 0 = any batch (testing)
                 dev->props.moe_wl     = getenv("GGML_METAL_MOE_WL")     ? atoi(getenv("GGML_METAL_MOE_WL"))     : 2;

@@ -328,6 +328,8 @@ struct ggml_metal_device_props {
 
     int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K, 8 q5_K v2.1, 9 iq3_s v2.1, 10 iq3_xxs v2.1 (5-10 dense only; 8 overrides 4, 9 and 10 override 0 and 1 except in split mode); 0 = old kernels
 
+    int mv_ext_k; // GGML_METAL_MV_EXT_K: bitmask of the K-quants that still take kernel_mul_mv_ext at ne11 = 4..8 on GPUs without simdgroup-mm, bits as mv_v2: 4 q5_K, 5 q3_K, 6 q4_K, 7 q6_K (default 0x80, q6_K only); a cleared type runs its n = 1 mat-vec once per src1 column instead, bit-identical per column to decode; 0xf0 = all on mul_mv_ext (the old routing); q2_K always takes mul_mv_ext
+
     int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
     int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)
     int moe_map;    // GGML_METAL_MOE_MAP: 1 = kernel_mul_mm_id_map_wl2 (default), 0 = kernel_mul_mm_id_map_wl

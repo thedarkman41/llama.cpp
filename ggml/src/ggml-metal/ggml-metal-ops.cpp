@@ -3004,6 +3004,26 @@ size_t ggml_metal_op_mul_mat_extra_b_f16(const ggml_tensor * op, bool has_simdgr
     return (size_t) ggml_nelements(op->src[1]) * sizeof(ggml_fp16_t);
 }
 
+// K-quant src0 types that take kernel_mul_mv_ext at ne11 = 4..8. On GPUs without simdgroup-mm the generic float4x4
+// K-quant dequantizers of mul_mv_ext are ALU-bound: q3_K, q4_K and q5_K cost 5.0-7.2x their n = 1 time at n = 4
+// and 10-13x at n = 8, while their n = 1 mat-vec (v2 bodies) run once per src1 column, as at ne11 = 2..3, costs
+// ~n x and gives each column exactly the decode result. q6_K on mul_mv_ext is at par or faster (3.3-3.7x at n = 4)
+// and stays there by default; GGML_METAL_MV_EXT_K picks the set (bits as GGML_METAL_MV_V2). q2_K is unchanged.
+static bool ggml_metal_op_mul_mat_ext_k(ggml_type type, const ggml_metal_device_props * props) {
+    int bit = -1;
+
+    switch (type) {
+        case GGML_TYPE_Q2_K: return true;
+        case GGML_TYPE_Q5_K: bit = 4; break;
+        case GGML_TYPE_Q3_K: bit = 5; break;
+        case GGML_TYPE_Q4_K: bit = 6; break;
+        case GGML_TYPE_Q6_K: bit = 7; break;
+        default:             return false;
+    }
+
+    return props->has_simdgroup_mm || ((props->mv_ext_k >> bit) & 1);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3056,13 +3076,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
-          (
-           op->src[0]->type == GGML_TYPE_Q4_K ||
-           op->src[0]->type == GGML_TYPE_Q5_K ||
-           op->src[0]->type == GGML_TYPE_Q6_K ||
-           op->src[0]->type == GGML_TYPE_Q2_K ||
-           op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+          ggml_metal_op_mul_mat_ext_k(op->src[0]->type, props_dev) && (ne11 >= 4 && ne11 <= 8)
          )
         )
        ) {
