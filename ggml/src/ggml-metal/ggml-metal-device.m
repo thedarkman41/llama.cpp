@@ -1725,6 +1725,13 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
                 }
 
+                // tiled mul_mm: f32 -> f16 convert of a contiguous src1 only for grids with at least this many M tiles (each M tile re-reads
+                // B; with fewer, reading the f32 B directly is cheaper than the convert pass) or an f32 src0; 0 = always convert
+                dev->props.mm_b16_mintiles = getenv("GGML_METAL_MM_B16_MINTILES") ? atoi(getenv("GGML_METAL_MM_B16_MINTILES")) : 3;
+                if (dev->props.mm_b16_mintiles != 3) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_B16_MINTILES=%d\n", __func__, dev->props.mm_b16_mintiles);
+                }
+
                 // f16 mat-vecs that share src0 rows across the GQA src1 batches (bit 0 short rows, bit 1 long rows): default on GPUs without simdgroup-mm.
                 // GGML_METAL_MV_GQA is read as decimal or 0x hex (no octal): a value < 0 or a non-number turns both off (as before
                 // the bitmask), bits above 1 are ignored; anything outside 0..3 is reported

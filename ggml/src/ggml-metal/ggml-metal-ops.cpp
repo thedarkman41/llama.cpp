@@ -3072,18 +3072,28 @@ size_t ggml_metal_op_mul_mat_extra_ks(const ggml_tensor * op, const ggml_metal_d
     return (size_t) ks*ggml_nelements(op)*sizeof(float);
 }
 
-// Lever A: scratch for converting activations (src1) f32 -> f16 once, to halve the
-// B-staging VRAM traffic in the scalar tiled GEMM. Returned size is 0 unless this op
-// will take the tiled f16-activation path. The gate MUST match the dispatch below.
-size_t ggml_metal_op_mul_mat_extra_b_f16(const ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor) {
-    if (op->op != GGML_OP_MUL_MAT) {
-        return 0;
+// Lever A: the tiled GEMM reads a contiguous f32 src1 from an f16 copy made by one convert pass, which halves the B bytes
+// of the GEMM. Every M tile re-reads B, so with few M tiles the convert pass costs more than it saves: then the GEMM reads
+// the f32 B itself (GGML_METAL_MM_B16_MINTILES, 0 = always convert). Measured at ub 512: KQV at head dim 256 (M = 256)
+// 1.06-1.6x, q8_0 M = 48 1.2x; but an f32 src0 with an f32 B is slower (f32 M = 256 K = 2048 0.91x, M = 32 0.94x), so
+// f32 src0 keeps the convert. The GEMM's (half) cast of B rounds like kernel_mm_cvt_f32_f16, so the result is the same.
+// The f32 B loads are float4: src1 must start 16-byte aligned (tensors are allocated 32-byte aligned, so a view offset of
+// a multiple of 16 is enough).
+// The one gate of the dispatch, the f16 scratch (ggml_metal_op_mul_mat_extra_b_f16) and the split-K plane offset
+static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (!ggml_metal_op_mul_mat_use_tiled(op, props->has_simdgroup_mm, props->has_tensor) || !ggml_is_contiguous(op->src[1])) {
+        return false;
     }
-    // must match the tiled dispatch in ggml_metal_op_mul_mat
-    if (!ggml_metal_op_mul_mat_use_tiled(op, has_simdgroup_mm, has_tensor)) {
-        return 0;
-    }
-    if (!ggml_is_contiguous(op->src[1])) {
+
+    const int64_t mtiles = (op->src[0]->ne[1] + GGML_METAL_TILED_MM_BM - 1)/GGML_METAL_TILED_MM_BM;
+    const bool    b_al16 = op->src[1]->view_src == nullptr || op->src[1]->view_offs % 16 == 0;
+
+    return props->mm_b16_mintiles <= 0 || mtiles >= props->mm_b16_mintiles || op->src[0]->type == GGML_TYPE_F32 || !b_al16;
+}
+
+// scratch of the f16 copy of src1 (see ggml_metal_op_mul_mat_use_f16_act), 0 if the op does not take it
+size_t ggml_metal_op_mul_mat_extra_b_f16(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (op->op != GGML_OP_MUL_MAT || !ggml_metal_op_mul_mat_use_f16_act(op, props)) {
         return 0;
     }
 
@@ -3227,13 +3237,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // scalar shared-memory tiled GEMM: third mul_mm path for GPUs with
         // neither simdgroup-matrix nor the tensor API (PoC: f16, q4_K)
 
-        // Lever A: when activations (src1) are contiguous f32, pre-convert them once
-        // into an f16 scratch (carved from this op's own dst buffer) and run the
-        // f16-activation kernel variant. The tiled kernel already truncates B to half on
-        // every staging read, so this is numerically identical while halving B-staging
-        // VRAM traffic (B is re-read ne01/BM times). Non-contiguous src1 falls back to
-        // the f32 variant.
-        const bool use_f16_act = ggml_is_contiguous(op->src[1]);
+        // Lever A: when activations (src1) are contiguous f32 and B is re-read by enough M tiles, pre-convert them once
+        // into an f16 scratch (carved from this op's own dst buffer) and run the f16-activation kernel variant. The tiled
+        // kernel already rounds B to half on every staging read, so this is numerically identical while halving
+        // B-staging VRAM traffic (B is re-read ne01/BM times). Otherwise the f32 variant reads src1 directly
+        const bool use_f16_act = ggml_metal_op_mul_mat_use_f16_act(op, props_dev);
 
         ggml_metal_buffer_id bid_b = ggml_metal_get_buffer_id(op->src[1]);
 
