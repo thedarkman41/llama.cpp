@@ -324,6 +324,7 @@ struct ggml_metal_device_props {
 
     int mm_wc; // GGML_METAL_MM_WC: 1 = kernel_mul_mm_wc (default), 0 = kernel_mul_mm_tiled, 2 = kernel_mul_mm_wc with late staging
     int mm_dq2; // GGML_METAL_MM_DQ2: bitmask of the kernel_mul_mm_wc dq2 A loaders: bit 0 q3_K, 1 q4_K, 2 q6_K, 3 iq4_xs, 4 iq3_s, 5 iq3_xxs, 6 iq2_s (default 0x7f); 0 = dequantize_* loaders
+    int mm_raw; // GGML_METAL_MM_RAW: bitmask of the kernel_mul_mm_wc raw A loaders on the dq2 map (16-byte row loads): bit 0 f16, bit 1 f32 (default 0x1, f32 opt-in); 0 = the guarded mm_wc_load_a loader
 
     int mv_gqa; // GGML_METAL_MV_GQA: bitmask of the GQA f16 x f32 mat-vecs (one src1 row per batch, each src0 row read once for its r2 src1 batches): bit 0 ne00 <= 512 (decode KQ, KQV at n_kv <= 512; kernel_mul_mv_f16_f32_gqa), bit 1 ne00 > 512 (decode KQV at n_kv > 512; kernel_mul_mv_f16_f32_gqa_long, the arithmetic of kernel_mul_mv_f16_f32_4, bit-identical to it as compiled and checked); default 3 on GPUs without simdgroup-mm, else 0; 1 = bit 0 only (the previous default); decimal or 0x hex, < 0 = 0, higher bits ignored
 

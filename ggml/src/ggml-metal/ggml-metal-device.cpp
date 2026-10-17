@@ -1164,8 +1164,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc(ggml_m
     snprintf(base, 256, "kernel_mul_mm_wc_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_early=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_ks=%d_dq2=%d", base, early, ne12, ne13, r2, r3, ks, dq2);
 
+    bool compiled = false;
+
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
+        compiled = true;
+
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
@@ -1189,6 +1193,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc(ggml_m
     res.nr1  = BN;
     res.nsg  = ((BM/TM)*(BN/TN))/32;
     res.smem = (BK*BM + BK*BN)*sizeof(ggml_fp16_t);
+
+    // ggml_metal_op_mul_mat then runs kernel_mul_mm_tiled instead: say so once per pipeline
+    if (compiled && res.pipeline && ggml_metal_pipeline_max_theads_per_threadgroup(res) < 32*res.nsg) {
+        GGML_LOG_WARN("%s: %s cannot launch %d threads (max %d), the GEMMs of this variant run kernel_mul_mm_tiled\n", __func__,
+                name, 32*res.nsg, ggml_metal_pipeline_max_theads_per_threadgroup(res));
+    }
 
     return res;
 }

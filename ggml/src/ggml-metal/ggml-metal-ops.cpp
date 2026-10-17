@@ -3284,7 +3284,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         int ks = ggml_metal_op_mul_mat_ks(op, props_dev);
 
         // dq2 A loaders of kernel_mul_mm_wc (GGML_METAL_MM_DQ2): q4_K reads the 16-byte block header as one uint4, iq4_xs reads uint2s,
-        // the others read ushorts
+        // the others read ushorts. the raw f16 / f32 loaders on the same map (GGML_METAL_MM_RAW) read 16-byte row segments of whole
+        // 64-wide chunks
         const uint64_t al0 = ggml_metal_get_buffer_id(op->src[0]).offs | nb01 | nb02 | nb03;
         const bool dq2 =
             (op->src[0]->type == GGML_TYPE_Q3_K    && (props_dev->mm_dq2 & 0x01) && al0 % 2  == 0) ||
@@ -3293,7 +3294,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             (op->src[0]->type == GGML_TYPE_IQ4_XS  && (props_dev->mm_dq2 & 0x08) && al0 % 8  == 0) ||
             (op->src[0]->type == GGML_TYPE_IQ3_S   && (props_dev->mm_dq2 & 0x10) && al0 % 2  == 0) ||
             (op->src[0]->type == GGML_TYPE_IQ3_XXS && (props_dev->mm_dq2 & 0x20) && al0 % 2  == 0) ||
-            (op->src[0]->type == GGML_TYPE_IQ2_S   && (props_dev->mm_dq2 & 0x40) && al0 % 2  == 0);
+            (op->src[0]->type == GGML_TYPE_IQ2_S   && (props_dev->mm_dq2 & 0x40) && al0 % 2  == 0) ||
+            (op->src[0]->type == GGML_TYPE_F16     && (props_dev->mm_raw & 0x01) && al0 % 16 == 0 && ne00 % 64 == 0) ||
+            (op->src[0]->type == GGML_TYPE_F32     && (props_dev->mm_raw & 0x02) && al0 % 16 == 0 && ne00 % 64 == 0);
 
         // kernel_mul_mm_wc by default (GGML_METAL_MM_WC=0 selects kernel_mul_mm_tiled): same tile, grid and f16 scratch
         auto pipeline = props_dev->mm_wc > 0
@@ -3301,7 +3304,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             : ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
 
         if (props_dev->mm_wc > 0 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 32*pipeline.nsg) {
-            // cannot launch 256 threads: keep the baseline
+            // cannot launch 256 threads: keep the baseline (ggml_metal_library_get_pipeline_mul_mm_wc warns once per pipeline)
             pipeline = ggml_metal_library_get_pipeline_mul_mm_tiled(lib, op, use_f16_act);
             ks = 1;
         }
