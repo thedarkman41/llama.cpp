@@ -996,6 +996,27 @@ void mm_wl_dec_tab(device const block_iq4_xs * xb, const thread uint * r, int c,
     mm_wc_dq2_dec_g(xb, r, c, aks, v, sg, (threadgroup const float *) tab);
 }
 
+// raw f16 / f32 A rows on the dq2 map (GGML_METAL_MM_RAW bits 0x1, 0x2): lane aks of row x takes the halves at
+// k = k0 + 8*aks..+7 (h[0]) and k0 + 32 + 8*aks..+7 (h[1]) as 16-byte loads, f32 rounds with the (half) cast of
+// dequantize_f32. the host checks K % 64 == 0 (whole chunks) and 16-byte aligned rows
+template<typename block_q>
+void mm_wc_raw_load(device const block_q * x, int k0, int aks, thread uint4 * h) {
+    h[0] = uint4(0);
+    h[1] = uint4(0);
+}
+
+void mm_wc_raw_load(device const half4x4 * x, int k0, int aks, thread uint4 * h) {
+    device const uint4 * p = (device const uint4 *) ((device const half *) x + k0) + aks;
+    h[0] = p[0];
+    h[1] = p[4];
+}
+
+void mm_wc_raw_load(device const float4x4 * x, int k0, int aks, thread uint4 * h) {
+    device const float4 * p = (device const float4 *) ((device const float *) x + k0) + 2*aks;
+    h[0] = uint4(as_type<uint2>((half4) p[0]), as_type<uint2>((half4) p[1]));
+    h[1] = uint4(as_type<uint2>((half4) p[8]), as_type<uint2>((half4) p[9]));
+}
+
 // k row in the chunk of the staged A word wa[i]
 static inline int mm_wc_ka(bool dq2, int aks, int i) {
     return dq2 ? (i < 8 ? 8*aks + i : 24 + 8*aks + i) : 16*aks + i;
@@ -1080,9 +1101,11 @@ kernel void kernel_mul_mm_wc(
         }
     }
 
-    // dq2 split loaders (all dq2 types but q3_K and q4_K) with the row pointers out of the loop
-    // QK_K blocks, K % 256 == 0, so every chunk is whole. rows past M read row M - 1 (their outputs are not stored)
-    constexpr bool dq2_sp = !is_same<block_q, block_q3_K>::value && !is_same<block_q, block_q4_K>::value;
+    // dq2 split loaders (all quantized dq2 types but q3_K and q4_K) and raw f16/f32 loaders with the row pointers out of
+    // the loop. QK_K blocks (K % 256 == 0) or raw rows (K % 64 == 0), so every chunk is whole. rows past M read row M - 1
+    // (their outputs are not stored)
+    constexpr bool dq2_raw = is_same<block_q, half4x4>::value || is_same<block_q, float4x4>::value;
+    constexpr bool dq2_sp  = !dq2_raw && !is_same<block_q, block_q3_K>::value && !is_same<block_q, block_q4_K>::value;
     device const block_q * xr0 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp,      M - 1));
     device const block_q * xr1 = (device const block_q *) (src0 + offset0 + args.nb01*min(ra + arp + 64, M - 1));
 
@@ -1092,7 +1115,18 @@ kernel void kernel_mul_mm_wc(
         }
 
         uint wa[16];
-        if (FC_mul_mm_wc_dq2 && dq2_sp) {
+        if (FC_mul_mm_wc_dq2 && dq2_raw) {
+            // the same half bits as the mm_wc_load_a path: word i is (row arp, row arp + 64) at k = mm_wc_ka(true, aks, i)
+            uint4 h0[2];
+            uint4 h1[2];
+            mm_wc_raw_load(xr0, k0, aks, h0);
+            mm_wc_raw_load(xr1, k0, aks, h1);
+            FOR_UNROLL (int i = 0; i < 16; i++) {
+                const uint x = h0[i/8][(i%8)/2];
+                const uint y = h1[i/8][(i%8)/2];
+                wa[i] = i % 2 == 0 ? (x & 0xFFFFu) | (y << 16) : (x >> 16) | (y & 0xFFFF0000u);
+            }
+        } else if (FC_mul_mm_wc_dq2 && dq2_sp) {
             uint r0[MM_WC_DQ2_NR];
             uint r1[MM_WC_DQ2_NR];
             mm_wc_dq2_load(xr0 + k0/QK_K, (k0/64) % 4, aks, r0);

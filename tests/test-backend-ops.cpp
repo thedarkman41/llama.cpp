@@ -7715,6 +7715,254 @@ struct test_mul_mat_pos : public test_mul_mat {
     }
 };
 
+// attention without flash attention, as llm_graph_context::build_attn_mha builds it on the KV cache views of
+// llama_kv_cache::get_k / get_v (f16 K/V):
+//   ATTN_MM_KQ:       kq  = mul_mat(k, q), k [hd, n_kv, n_head_kv, ns] with rows n_embd_k_gqa apart, q a permuted f32 view
+//   ATTN_MM_KQV:      kqv = mul_mat(v, kq), v the V^T view (v_trans) [n_kv, hd, n_head_kv, ns] with rows kv_size apart
+//   ATTN_MM_KQV_CONT: kqv = mul_mat(cont(transpose(v)), kq), v not transposed in the cache (-fa auto without flash attention)
+// with the GQA broadcast n_head/n_head_kv and ns streams (non-unified KV cache, 4D views). kq (src1 of kqv) is softmax-like:
+// uniform in [0, 2/n_kv], or with subnormal uniform in [1e-7, 1e-4] (mostly f16 subnormals)
+enum attn_mm_mode {
+    ATTN_MM_KQ,
+    ATTN_MM_KQV,
+    ATTN_MM_KQV_CONT,
+};
+
+static std::string var_to_str(attn_mm_mode mode) {
+    switch (mode) {
+        case ATTN_MM_KQ:       return "kq";
+        case ATTN_MM_KQV:      return "kqv";
+        case ATTN_MM_KQV_CONT: return "kqv_cont";
+    }
+    return "unknown";
+}
+
+struct test_mul_mat_attn : public test_case {
+    const attn_mm_mode mode;
+    const int64_t hd;        // head dim
+    const int64_t n_head;    // q heads
+    const int64_t n_head_kv; // kv heads
+    const int64_t n_kv;
+    const int64_t kv_size;   // cache size >= n_kv
+    const int64_t n_tokens;  // per stream
+    const int64_t ns;        // streams
+    const bool    subnormal;
+
+    std::string vars() override {
+        return VARS_TO_STR9(mode, hd, n_head, n_head_kv, n_kv, kv_size, n_tokens, ns, subnormal);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*n_kv*n_tokens*hd*n_head*ns;
+    }
+
+    test_mul_mat_attn(attn_mm_mode mode = ATTN_MM_KQ, int64_t hd = 256, int64_t n_head = 16, int64_t n_head_kv = 2,
+            int64_t n_kv = 512, int64_t kv_size = 512, int64_t n_tokens = 512, int64_t ns = 1, bool subnormal = false)
+        : mode(mode), hd(hd), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), kv_size(kv_size), n_tokens(n_tokens), ns(ns),
+          subnormal(subnormal) {
+        GGML_ASSERT(kv_size >= n_kv && n_head % n_head_kv == 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd_gqa = hd*n_head_kv;
+
+        ggml_tensor * out;
+        if (mode == ATTN_MM_KQ) {
+            ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_gqa, kv_size, ns);
+            ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, n_head, n_tokens*ns);
+            ggml_set_name(k_cache, "k_cache");
+            ggml_set_name(q, "q");
+
+            ggml_tensor * k = ggml_view_4d(ctx, k_cache, hd, n_head_kv, n_kv, ns,
+                    ggml_row_size(GGML_TYPE_F16, hd),
+                    ggml_row_size(GGML_TYPE_F16, n_embd_gqa),
+                    ggml_row_size(GGML_TYPE_F16, n_embd_gqa*kv_size), 0);
+            q = ggml_view_4d(ctx, q, hd, n_head, n_tokens, ns, q->nb[1], q->nb[2], q->nb[2]*n_tokens, 0);
+
+            q = ggml_permute(ctx, q, 0, 2, 1, 3);
+            k = ggml_permute(ctx, k, 0, 2, 1, 3);
+
+            out = ggml_mul_mat(ctx, k, q);
+        } else {
+            ggml_tensor * kq = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens, n_head, ns);
+            ggml_set_name(kq, "kq");
+
+            ggml_tensor * v;
+            if (mode == ATTN_MM_KQV) {
+                ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kv_size, n_embd_gqa, ns);
+                ggml_set_name(v_cache, "v_cache");
+                v = ggml_view_4d(ctx, v_cache, n_kv, n_head_kv, hd, ns,
+                        ggml_row_size(GGML_TYPE_F16, kv_size*hd),
+                        ggml_row_size(GGML_TYPE_F16, kv_size),
+                        ggml_row_size(GGML_TYPE_F16, kv_size*n_embd_gqa), 0);
+                v = ggml_permute(ctx, v, 0, 2, 1, 3);
+            } else {
+                ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_gqa, kv_size, ns);
+                ggml_set_name(v_cache, "v_cache");
+                v = ggml_view_4d(ctx, v_cache, hd, n_head_kv, n_kv, ns,
+                        ggml_row_size(GGML_TYPE_F16, hd),
+                        ggml_row_size(GGML_TYPE_F16, n_embd_gqa),
+                        ggml_row_size(GGML_TYPE_F16, n_embd_gqa*kv_size), 0);
+                v = ggml_permute(ctx, v, 0, 2, 1, 3);
+                v = ggml_cont(ctx, ggml_transpose(ctx, v));
+            }
+
+            out = ggml_mul_mat(ctx, v, kq);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kq") == 0) {
+                if (subnormal) {
+                    init_tensor_uniform(t, 1e-7f, 1e-4f);
+                } else {
+                    init_tensor_uniform(t, 0.0f, 2.0f/n_kv);
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// mul_mat of an f16 / f32 A read through a 2D view that starts offs elements into a larger tensor (Metal: the raw A loaders
+// of kernel_mul_mm_wc need 16-byte aligned rows, so a view at 2 / 4 / 8 bytes must take the guarded loader), with A data
+// that the staging of A must carry bit-exactly:
+//   MM_A_UNIFORM:  A and B uniform in [-1, 1]
+//   MM_A_SUBN_EYE: A f16 subnormals of either sign (f32 A: the same values) and some -0, B a one-hot readout
+//                  B[n][i] = (i == n % k): every output is one A element, so a staging path that flushes subnormals or
+//                  misplaces an A word fails
+//   MM_A_INF:      A uniform in [-1, 1] with one +-Inf in every 7th row, B uniform in [0.5, 1]: those rows must give an Inf
+//                  of the same sign, the others the finite results
+enum mul_mat_a_data {
+    MM_A_UNIFORM,
+    MM_A_SUBN_EYE,
+    MM_A_INF,
+};
+
+static std::string var_to_str(mul_mat_a_data data) {
+    switch (data) {
+        case MM_A_UNIFORM:  return "uniform";
+        case MM_A_SUBN_EYE: return "subn_eye";
+        case MM_A_INF:      return "inf";
+    }
+    return "unknown";
+}
+
+struct test_mul_mat_a_view : public test_case {
+    const ggml_type      type_a;
+    const int64_t        m;
+    const int64_t        n;
+    const int64_t        k;
+    const int64_t        offs; // elements of type_a
+    const mul_mat_a_data data;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, offs, data);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    // NMSE over the outputs that are finite in both: the caller already requires the Inf ones to match in sign, and they
+    // would make the plain NMSE NaN (which passes any bound)
+    double err(const float * a, const float * b, size_t n) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                continue;
+            }
+            mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+            mse_a_0 += (double) a[i]*a[i];
+        }
+        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
+    }
+
+    test_mul_mat_a_view(ggml_type type_a = GGML_TYPE_F16, int64_t m = 384, int64_t n = 512, int64_t k = 256, int64_t offs = 0,
+            mul_mat_a_data data = MM_A_UNIFORM)
+        : type_a(type_a), m(m), n(n), k(k), offs(offs), data(data) {
+        GGML_ASSERT(type_a == GGML_TYPE_F16 || type_a == GGML_TYPE_F32);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ab = ggml_new_tensor_1d(ctx, type_a, k*m + offs);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(ab, "a_base");
+        ggml_set_name(b,  "b");
+
+        ggml_tensor * a = ggml_view_2d(ctx, ab, k, m, k*ggml_type_size(type_a), offs*ggml_type_size(type_a));
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a_base") == 0) {
+                const int64_t ne = ggml_nelements(t);
+                std::vector<float> v(ne);
+                for (int64_t i = 0; i < ne; i++) {
+                    if (data == MM_A_SUBN_EYE) {
+                        const uint32_t r = rng();
+                        const uint16_t h = (r % 16 == 0) ? 0x8000 : (uint16_t) ((r & 0x8000u) | (1u + (r >> 16) % 1023u));
+                        v[i] = ggml_fp16_to_fp32(h);
+                    } else {
+                        v[i] = u(rng);
+                    }
+                }
+                if (data == MM_A_INF) {
+                    for (int64_t r = 3; r < m; r += 7) {
+                        v[offs + r*k + (r*13) % k] = (r/7) % 2 ? -INFINITY : INFINITY;
+                    }
+                }
+                if (type_a == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, v.data(), 0, ne*sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> h(ne);
+                    ggml_fp32_to_fp16_row(v.data(), h.data(), ne);
+                    ggml_backend_tensor_set(t, h.data(), 0, ne*sizeof(ggml_fp16_t));
+                }
+            } else if (strcmp(t->name, "b") == 0) {
+                std::vector<float> v(k*n);
+                for (int64_t j = 0; j < n; j++) {
+                    for (int64_t i = 0; i < k; i++) {
+                        v[j*k + i] = data == MM_A_SUBN_EYE ? (i == j % k ? 1.0f : 0.0f) :
+                                     data == MM_A_INF      ? 0.75f + 0.25f*u(rng) : u(rng);
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, k*n*sizeof(float));
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 enum mul_mat_add_mode {
     MUL_MAT_ADD_MM_RES,     // mm + res
     MUL_MAT_ADD_RES_MM,     // res + mm
@@ -10990,6 +11238,66 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 33, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
     }
 
+    // Metal kernel_mul_mm_wc raw f16 / f32 A loaders (dq2 map): the attention mat-muls without flash attention at head dim
+    // 256 of the 35B (16 q / 2 kv heads) and the 27Bs (24 / 4): KQ with a permuted f32 q, KQV with the V^T view (rows kv_size
+    // apart, kv_size > n_kv: non-contiguous rows) and with cont(transpose(v)); n_kv not a multiple of 128 (M tail of KQ),
+    // few tokens (speculative decoding: permuted f32 B at n = 9..31), two streams (4D views), a softmax-like B in the f16
+    // subnormal range
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        for (int64_t n_tok : {9, 16, 31, 512}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,  256, nh, nhkv, 1280, 1280, n_tok));
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, 1280, 1536, n_tok));
+        }
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv,  256,  512, 509));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 4100, 4352, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 8448, 8448, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv,  512,  512, 509));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 8448, 8704, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV_CONT, 256, nh, nhkv, 4096, 4352, 512));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,       256, nh, nhkv, 1024, 1280, 256, 2));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 1024, 1280, 256, 2));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV,      256, nh, nhkv, 4096, 4096, 512, 1, true));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV_CONT, 256, nh, nhkv, 2048, 2048, 512, 1, true));
+    }
+    // generic f16 / f32 shapes of the raw loaders: K = 64 (one chunk), K tails (k % 64 != 0: the guarded loaders), row strides
+    // that are 8- but not 16-byte aligned (k_v = k + 4) or only 2-byte aligned (k_v = k + 1): the guarded loaders, M tails
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t n : {9, 100, 512}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{191, 256}, {4100, 64}, {4100, 256}, {1000, 2051}, {130, 4100}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1028));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1025));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, n, 768, {2, 2}, {2, 1}, {0, 2, 1, 3}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  256, 512,  2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 14336, {1, 1}, {1, 1}));
+    }
+    // edges of the raw loaders: subnormal A read out through a one-hot B and +-Inf A at M = 256 / 384 / 4100 (1-2 M tiles
+    // and an M tail); A views at 2 / 4 / 8 bytes with 16-byte aligned row strides (guarded loader) and at 16 / 32 / 64 bytes
+    // (raw loader); r2 = r3 = 2 broadcast; M < 64 (both staged rows clamp to M - 1); uneven split-K (K = 832: 13 chunks in 2
+    // splits, K = 4288: 67 chunks in 8); a row stride 8- but not 16-byte aligned for f32 (k_v = k + 2)
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t m : {256, 384, 4100}) {
+            test_cases.emplace_back(new test_mul_mat_a_view(type_a, m, 256, 256, 0, MM_A_SUBN_EYE));
+        }
+        for (auto [m, n] : std::vector<std::pair<int64_t, int64_t>>{{256, 512}, {384, 512}, {4100, 100}}) {
+            test_cases.emplace_back(new test_mul_mat_a_view(type_a, m, n, 1024, 0, MM_A_INF));
+        }
+        for (int64_t offs : {1, 2, 4, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat_a_view(type_a, 384, 512, 256, offs, MM_A_UNIFORM));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 512, 256, {2, 2}, {2, 2}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 384, 100, 256, {1, 2}, {3, 2}));
+        for (int64_t m : {32, 48, 63}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 512, 4096, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 512,  832, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 256, 4288, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 130, 200, 4288, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 100, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1026));
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
@@ -12540,6 +12848,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // prefill attention without flash attention (ub 512) at head dim 256 (35B: 16 q / 2 kv heads, 27B: 24 / 4): KQ and KQV
+    // at n_kv = kv_size 8192 / 16384 (power-of-two row strides) and 8448 / 16896
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        for (int64_t n_kv : {8192, 8448, 16384, 16896}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,  256, nh, nhkv, n_kv, n_kv, 512));
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, n_kv, n_kv, 512));
+        }
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

@@ -1723,6 +1723,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_DQ2=0x%x\n", __func__, dev->props.mm_dq2);
                 }
 
+                // kernel_mul_mm_wc raw f16 (bit 0) and f32 (bit 1) A loaders on the dq2 map, only used on GPUs without simdgroup-mm;
+                // 0 = the guarded mm_wc_load_a loader. The f32 one is opt-in: faster on small f32 grids (M = 256 K = 2048 N = 512
+                // 1.11x), slower on large ones (8192x512x512 0.85x, 2048x512x2048 0.83x)
+                dev->props.mm_raw = getenv("GGML_METAL_MM_RAW") ? (int) strtol(getenv("GGML_METAL_MM_RAW"), NULL, 0) : 0x1;
+                if (dev->props.mm_raw != 0x1) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_RAW=0x%x\n", __func__, dev->props.mm_raw);
+                }
+
                 // short-row f16 mat-vecs that share src0 rows across the GQA src1 batches: default on GPUs without simdgroup-mm
                 dev->props.mv_gqa = getenv("GGML_METAL_MV_GQA") ? atoi(getenv("GGML_METAL_MV_GQA")) : (dev->props.has_simdgroup_mm ? 0 : 1);
                 if (getenv("GGML_METAL_MV_GQA")) {
