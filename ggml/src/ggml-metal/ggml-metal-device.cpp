@@ -1527,6 +1527,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gqa(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gqa_long(ggml_metal_library_t lib, const ggml_tensor * op, int nr0) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(nr0 == 1 || nr0 == 2 || nr0 == 4);
+
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mv_f16_f32_gqa_long_nr0_%d", nr0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    // 4 simdgroups (the nsg of kernel_mul_mv_f16_f32_4 at ne00 > 384) on nr0 rows x up to 8 src1 batches
+    res.nr0  = nr0;
+    res.nr1  = 1;
+    res.nsg  = 4;
+    res.smem = (size_t) nr0*8*32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib) {
     char base[256];
     char name[256];
