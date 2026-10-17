@@ -1731,6 +1731,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_RAW=0x%x\n", __func__, dev->props.mm_raw);
                 }
 
+                // tiled mul_mm: f32 -> f16 convert of a contiguous src1 only for grids with at least this many M tiles (each M tile re-reads
+                // B; with fewer, reading the f32 B directly is cheaper than the convert pass), an f32 src0 or a src1 view that does not start
+                // 16-byte aligned; 0 = always convert
+                dev->props.mm_b16_mintiles = getenv("GGML_METAL_MM_B16_MINTILES") ? atoi(getenv("GGML_METAL_MM_B16_MINTILES")) : 3;
+                if (dev->props.mm_b16_mintiles != 3) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_B16_MINTILES=%d\n", __func__, dev->props.mm_b16_mintiles);
+                }
+
                 // short-row f16 mat-vecs that share src0 rows across the GQA src1 batches: default on GPUs without simdgroup-mm
                 dev->props.mv_gqa = getenv("GGML_METAL_MV_GQA") ? atoi(getenv("GGML_METAL_MV_GQA")) : (dev->props.has_simdgroup_mm ? 0 : 1);
                 if (getenv("GGML_METAL_MV_GQA")) {

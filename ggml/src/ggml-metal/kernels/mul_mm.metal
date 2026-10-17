@@ -395,6 +395,7 @@ void mm_tiled_stage(
         uint64_t nb01,
         uint64_t offset0,
         int strideB,
+        bool b_vec_ok,
         int ra, int rb, int M, int N, int K, int k0,
         ushort tiitg) {
     constexpr short A_ITEMS = BM*(BK/16);
@@ -440,7 +441,7 @@ void mm_tiled_stage(
         const int   kp    = k0 + kbase;
 
         half4 vh;
-        if (gn < N && kp + 3 < K) {
+        if (b_vec_ok && gn < N && kp + 3 < K) {
             vh = (half4)(*(device const T1_4 *)(ptrB + (size_t) gn*strideB + kp));
         } else {
             vh.x = (gn < N && kp + 0 < K) ? (half) ptrB[(size_t) gn*strideB + kp + 0] : (half) 0;
@@ -500,6 +501,9 @@ kernel void kernel_mul_mm_tiled(
     device const T1 * ptrB = (device const T1 *)(src1 + args.nb12*i12 + args.nb13*i13);
     const int strideB = args.nb11/sizeof(T1);
 
+    // T1_4 loads of B need 4-element aligned rows (strideB) and an aligned base and batch strides (args.b_vec, host-checked)
+    const bool b_vec_ok = args.b_vec != 0 && strideB % 4 == 0;
+
     const short tc = tiitg % NTX; // this thread's column group (N)
     const short tr = tiitg / NTX; // this thread's row group (M)
 
@@ -513,7 +517,7 @@ kernel void kernel_mul_mm_tiled(
 
     for (int k0 = 0; k0 < K; k0 += BK) {
         mm_tiled_stage<T0, T0_4x4, block_q, nl, dequantize_func, T1, T1_4, BM, BN, BK, NTHREAD>(
-            As, Bs, src0, ptrB, args.nb01, offset0, strideB, ra, rb, M, N, K, k0, tiitg);
+            As, Bs, src0, ptrB, args.nb01, offset0, strideB, b_vec_ok, ra, rb, M, N, K, k0, tiitg);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1073,8 +1077,9 @@ kernel void kernel_mul_mm_wc(
 
     device const T1 * ptrB = (device const T1 *)(src1 + args.nb12*i12 + args.nb13*i13);
 
+    // T1_4 loads of B need 4-element aligned rows (strideB) and an aligned base and batch strides (args.b_vec, host-checked)
     const int  strideB  = args.nb11/sizeof(T1);
-    const bool b_vec_ok = strideB % 4 == 0;
+    const bool b_vec_ok = args.b_vec != 0 && strideB % 4 == 0;
 
     // compute map, as kernel_mul_mm_tiled: rows TM*tr..TM*tr+7, cols TN*tc..TN*tc+7
     const int tc = tiitg % (BN/TN);

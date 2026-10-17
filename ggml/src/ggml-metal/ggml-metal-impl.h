@@ -529,6 +529,7 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    int16_t  b_vec; // kernel_mul_mm_tiled/_wc: src1 base, nb12 and nb13 are aligned for 4-element (T1_4) loads (host-checked)
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
