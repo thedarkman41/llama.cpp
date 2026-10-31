@@ -11203,6 +11203,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_b_offs(type_a, 512, 512, 1024, offs));
         }
     }
+    // Metal occupancy-aware split-K of kernel_mul_mm_wc for f16 / f32 src0 grids of a few waves (GGML_METAL_MM_KS_FP): KQV at
+    // head dim 256 at ub 256 (35B 64 tiles, 27B 96), a partial last column tile (n_tokens 300), two streams (4D batches); the
+    // grids it splits read the f32 B (M = 256) or an f16 copy of it (f16 M = 1408, f32 src0); 67 chunks (uneven splits)
+    for (auto [nh, nhkv] : std::vector<std::pair<int64_t, int64_t>>{{16, 2}, {24, 4}}) {
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, 4096, 4352, 256));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, 4352, 4352, 300, 1, true));
+        test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, 4096, 4096, 128, 2));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  256, 512, 4288, {16, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1408, 512, 4096, { 1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2048, 509, 4096, { 1, 1}, {1, 1}));
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
@@ -12773,6 +12784,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQ,  256, nh, nhkv, n_kv, n_kv, 512));
             test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, n_kv, n_kv, 512));
         }
+        // ub 256 (the KQV grid is 64 / 96 tiles), to n_kv 33024 (35B pp2048 at depth 30720..32768)
+        for (int64_t n_kv : {4352, 8448, 16896, 33024}) {
+            test_cases.emplace_back(new test_mul_mat_attn(ATTN_MM_KQV, 256, nh, nhkv, n_kv, n_kv, 256));
+        }
+    }
+
+    // resident threadgroups of kernel_mul_mm_wc (f16 src0, f32 B: the KQV variant) as in the GGML_METAL_MM_SLOTS rule: the same
+    // work per tile (M = 256, K = 8192) at 42..162 tiles; run with GGML_METAL_MM_KS_FP=0. with S resident threadgroups the time
+    // is ~ceil(tiles/S): S = 40 gives 2 2 2 3 3 3 4 4 5 rounds, S = 80 1 1 1 2 2 2 2 2 3
+    for (int64_t tiles : {42, 60, 80, 82, 100, 120, 122, 160, 162}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 64*tiles, 8192, {1, 1}, {1, 1}));
     }
 
     // FWHT tests

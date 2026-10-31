@@ -1732,6 +1732,18 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_INFO("%s: GGML_METAL_MM_B16_MINTILES=%d\n", __func__, dev->props.mm_b16_mintiles);
                 }
 
+                // occupancy-aware split-K of kernel_mul_mm_wc (A3) for f16 / f32 src0 grids of a few waves of the resident threadgroups
+                // (the fa-off attention KQV at depth), only for grids the base split rule leaves unsplit; it reassociates the FP32 sums
+                // over K. 0 = off; GGML_METAL_MM_KS_FP_FORCE=<ks> splits every such grid in ks (testing); GGML_METAL_MM_SLOTS = resident
+                // threadgroups the rule assumes (kernel_mul_mm_wc runs one per CU: 40 on the Radeon Pro 5700 XT)
+                dev->props.mm_ks_fp       = getenv("GGML_METAL_MM_KS_FP")       ? atoi(getenv("GGML_METAL_MM_KS_FP"))       : 1;
+                dev->props.mm_ks_fp_force = getenv("GGML_METAL_MM_KS_FP_FORCE") ? atoi(getenv("GGML_METAL_MM_KS_FP_FORCE")) : 0;
+                dev->props.mm_slots       = getenv("GGML_METAL_MM_SLOTS")       ? atoi(getenv("GGML_METAL_MM_SLOTS"))       : 40;
+                if (dev->props.mm_ks_fp != 1 || dev->props.mm_ks_fp_force != 0 || dev->props.mm_slots != 40) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MM_KS_FP=%d GGML_METAL_MM_KS_FP_FORCE=%d GGML_METAL_MM_SLOTS=%d\n", __func__,
+                            dev->props.mm_ks_fp, dev->props.mm_ks_fp_force, dev->props.mm_slots);
+                }
+
                 // short-row f16 mat-vecs that share src0 rows across the GQA src1 batches: default on GPUs without simdgroup-mm
                 dev->props.mv_gqa = getenv("GGML_METAL_MV_GQA") ? atoi(getenv("GGML_METAL_MV_GQA")) : (dev->props.has_simdgroup_mm ? 0 : 1);
                 if (getenv("GGML_METAL_MV_GQA")) {

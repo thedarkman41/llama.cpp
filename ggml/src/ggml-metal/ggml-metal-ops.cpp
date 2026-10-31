@@ -2949,19 +2949,13 @@ static bool ggml_metal_op_mul_mat_use_tiled(const ggml_tensor * op, bool has_sim
 }
 
 // split-K for kernel_mul_mm_wc when its grid has few tiles (e.g. the MoE router M = 256, N = 512): the
-// number of K splits, so that the grid gets closer to ~80 threadgroups (2 per CU) with >= 4 BK chunks per
-// split. 1 = no split. quantized src0 (dequant-bound) only gains when the unsplit grid leaves at least
-// half of the ~40 CUs idle; at 24-40 tiles a split is 3-15% slower there
-static int ggml_metal_op_mul_mat_ks(const ggml_tensor * op, const ggml_metal_device_props * props) {
-    if (props->mm_wc <= 0 || !ggml_metal_op_mul_mat_use_tiled(op, props->has_simdgroup_mm, props->has_tensor)) {
-        return 1;
-    }
-
-    const int64_t bm      = GGML_METAL_TILED_MM_BM;
-    const int64_t tiles   = ((op->src[1]->ne[1] + bm - 1)/bm)*((op->src[0]->ne[1] + bm - 1)/bm)*op->src[1]->ne[2]*op->src[1]->ne[3];
-    const int64_t nchunks = (op->src[0]->ne[0] + 63)/64;
-
-    if (ggml_is_quantized(op->src[0]->type) && tiles > 20) {
+// number of K splits for grids of at most 40 tiles, with >= 4 BK chunks per split. 1 = no split. the rule was
+// written for ~80 resident threadgroups (2 per CU); kernel_mul_mm_wc actually runs one per CU (~40, see
+// GGML_METAL_MM_SLOTS), and the rule is kept as it is so that the grids it splits keep their results.
+// quantized src0 (dequant-bound) only gains when the unsplit grid leaves at least half of the ~40 CUs idle;
+// at 24-40 tiles a split is 3-15% slower there
+static int ggml_metal_op_mul_mat_ks_base(int64_t tiles, int64_t nchunks, bool quantized) {
+    if (quantized && tiles > 20) {
         return 1;
     }
 
@@ -2973,18 +2967,108 @@ static int ggml_metal_op_mul_mat_ks(const ggml_tensor * op, const ggml_metal_dev
     return ks;
 }
 
+// A3: occupancy-aware split-K for f16 / f32 src0 grids that ggml_metal_op_mul_mat_ks_base leaves unsplit (more than
+// 40 tiles). such a grid of a few waves of the ~S resident threadgroups (S = GGML_METAL_MM_SLOTS, one per CU) runs
+// its last wave part-empty: the 35B-A3B KQV at ub 512 (head dim 256: M = 256, N = 512, 16 heads) has 128 tiles,
+// 3.2 waves, i.e. 4 rounds at 80% occupancy; at ub 256 64 tiles, 2 rounds at 80%. with ks splits the grid has
+// tiles*ks threadgroups of ~nchunks/ks BK chunks each; modelled cost, in BK chunks of one threadgroup:
+//     cost(ks) = ceil(tiles*ks/S)*(nchunks/ks + C_TG) + [ks > 1] (ks + 1)*tiles*C_SUM
+// C_TG: per-threadgroup start-up and FP32 epilogue (~2 chunks); C_SUM: kernel_mul_mm_wc_ksum, which reads ks partial
+// planes and writes one (~1/90 chunk per tile and plane at ~350 GB/s and ~5 TFLOPS). the split is the ks in 2..8 of
+// the lowest cost at a long reference K (it does not depend on K: tiles*ks a multiple of S, so ks = 5 at S = 40 for
+// tile counts that are multiples of 8), taken only if it is also >= 5% cheaper than ks = 1 at the actual K. that
+// gain grows with K, so ks is 1 below some K and the same value above it. it reassociates the FP32 sums over K, so
+// the results change (by FP32 rounding); GGML_METAL_MM_KS_FP=0 keeps every such grid unsplit
+// (GGML_METAL_MM_KS_FP_FORCE=<ks> splits every one of them in ks, at most nchunks: testing)
+static int ggml_metal_op_mul_mat_ks_fp(int64_t tiles, int64_t nchunks, const ggml_metal_device_props * props) {
+    if (props->mm_ks_fp_force > 0) {
+        return (int) std::max<int64_t>(1, std::min<int64_t>(std::min(props->mm_ks_fp_force, 16), nchunks));
+    }
+
+    const int64_t S = std::max(props->mm_slots, 1);
+
+    if (props->mm_ks_fp <= 0 || nchunks < 64) {
+        return 1;
+    }
+
+    constexpr double C_TG  = 2.0;
+    constexpr double C_SUM = 1.0/90;
+    constexpr double N_REF = 256.0; // K = 16384
+
+    const auto cost = [&](int ks, double nch) {
+        const double rounds = (double) ((tiles*ks + S - 1)/S);
+        return rounds*(nch/ks + C_TG) + (ks > 1 ? (ks + 1)*tiles*C_SUM : 0.0);
+    };
+
+    int ks = 1;
+    for (int k = 2; k <= 8; k++) {
+        if (cost(k, N_REF) < cost(ks, N_REF)) {
+            ks = k;
+        }
+    }
+
+    if (ks == 1 || cost(ks, (double) nchunks) > 0.95*cost(1, (double) nchunks)) {
+        return 1;
+    }
+
+    return ks;
+}
+
+// the number of K splits of a tiled GEMM over op's src0 and a src1 of ntn column tiles (1 = no split)
+static int ggml_metal_op_mul_mat_ks_ntn(const ggml_tensor * op, const ggml_metal_device_props * props, int64_t ntn) {
+    const int64_t bm      = GGML_METAL_TILED_MM_BM;
+    const int64_t tiles   = ntn*((op->src[0]->ne[1] + bm - 1)/bm)*op->src[1]->ne[2]*op->src[1]->ne[3];
+    const int64_t nchunks = (op->src[0]->ne[0] + 63)/64;
+
+    const int ks = ggml_metal_op_mul_mat_ks_base(tiles, nchunks, ggml_is_quantized(op->src[0]->type));
+    if (ks > 1 || (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_F32)) {
+        return ks;
+    }
+
+    return ggml_metal_op_mul_mat_ks_fp(tiles, nchunks, props);
+}
+
+static int ggml_metal_op_mul_mat_ks(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (props->mm_wc <= 0 || !ggml_metal_op_mul_mat_use_tiled(op, props->has_simdgroup_mm, props->has_tensor)) {
+        return 1;
+    }
+
+    return ggml_metal_op_mul_mat_ks_ntn(op, props, (op->src[1]->ne[1] + GGML_METAL_TILED_MM_BM - 1)/GGML_METAL_TILED_MM_BM);
+}
+
 // scratch of the split-K partial planes [batch][ks][N][M] (FP32), after the f16 activations
+// the scheduler sizes the compute buffer from the graph of the largest ubatch (and the full KV cache), and a smaller
+// graph that needs more for a node re-plans it. the A3 split (f16 / f32 src0) can be larger at fewer src1 column
+// tiles (27B KQV at ub 512: 192 tiles, unsplit; a 257..384-token ubatch: 144 tiles, ks 5), so for those the scratch is
+// the largest over every src1 width up to N. it does not grow at a smaller K (KV depth): the A3 ks is 1 below some K
+// and the same above it
 size_t ggml_metal_op_mul_mat_extra_ks(const ggml_tensor * op, const ggml_metal_device_props * props) {
     if (op->op != GGML_OP_MUL_MAT) {
         return 0;
     }
 
     const int ks = ggml_metal_op_mul_mat_ks(op, props);
-    if (ks <= 1) {
-        return 0;
+
+    const bool ks_fp = (props->mm_ks_fp > 0 || props->mm_ks_fp_force > 0) &&
+        (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+        props->mm_wc > 0 && ggml_metal_op_mul_mat_use_tiled(op, props->has_simdgroup_mm, props->has_tensor);
+
+    if (!ks_fp) {
+        return ks <= 1 ? 0 : (size_t) ks*ggml_nelements(op)*sizeof(float);
     }
 
-    return (size_t) ks*ggml_nelements(op)*sizeof(float);
+    const int64_t bm = GGML_METAL_TILED_MM_BM;
+    const int64_t n  = op->src[1]->ne[1];
+
+    size_t res = 0;
+    for (int64_t ntn = 1; ntn <= (n + bm - 1)/bm; ntn++) {
+        const int ks_n = ggml_metal_op_mul_mat_ks_ntn(op, props, ntn);
+        if (ks_n > 1) {
+            res = std::max(res, (size_t) (ks_n*op->ne[0]*std::min(ntn*bm, n)*op->ne[2]*op->ne[3])*sizeof(float));
+        }
+    }
+
+    return res;
 }
 
 // Lever A: the tiled GEMM reads a contiguous f32 src1 from an f16 copy made by one convert pass, which halves the B bytes
