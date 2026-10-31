@@ -109,6 +109,8 @@
 #define N_R0_Q5_K_V21  2 // v2.1 body, for ne01 >= 512
 #define N_R0_IQ3_S_V21 4 // v2.1 body, for ne01 >= 4
 #define N_R0_IQ3_XXS_V21 4 // v2.1 body, for ne01 >= 4
+#define N_R0_IQ3_S_V21S 8 // v2.1s body (split mode, K = 256 or 512): rows per simdgroup for ne01 >= 8 (4/NB rows below); any of 4/NB, 4, 8, 16, 32
+#define N_SG_IQ3_S_V21S 4 // v2.1s body: simdgroups per threadgroup (1, 2, 4 or 8)
 
 #define N_R0_TQ2_0 4
 #define N_SG_TQ2_0 2

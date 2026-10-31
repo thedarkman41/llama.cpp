@@ -1204,6 +1204,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_wc_ksum(g
     return res;
 }
 
+// iq3_s v2.1s body (split mode, GGML_METAL_MV_V2 bit 11): blocks per row (nb), rows per simdgroup (nr0) and simdgroups
+// (nsg) for an iq3_s src0 of ne01 rows with nb32 32-weight sub-blocks per row (8 or 16, i.e. K = 256 or 512). nr0 is
+// props->mv_v21s_nr0 when ne01 has that many rows, else the 4/nb rows of one pass, so the clamped first row keeps every
+// read inside src0. false for fewer than 4/nb rows: the previous bodies run
+static bool ggml_metal_mv_iq3_s_v21s(const ggml_metal_device_props * props, int ne01, int nb32, int & nb, int & nr0, int & nsg) {
+    if (nb32 != 8 && nb32 != 16) {
+        return false;
+    }
+
+    const int nbr = nb32/8;
+    const int rg  = 4/nbr;
+
+    if (ne01 < rg) {
+        return false;
+    }
+
+    const int nr0s = std::max(props->mv_v21s_nr0, rg);
+
+    nb  = nbr;
+    nr0 = ne01 >= nr0s ? nr0s : rg;
+    nsg = props->mv_v21s_nsg;
+
+    return true;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1232,6 +1257,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const char * suffix = "";
 
     bool split = false;
+
+    int nb = 0; // blocks per row of the iq3_s v2.1s body (FC_mul_mv_nb), 0 = not used
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -1394,7 +1421,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ3_S:
             {
-                v2  = use_v2(0);
+                // the v2 and v2.1 bodies read ushorts, so 2-byte aligned blocks only (an odd src0 address takes the v1 body);
+                // the v2.1 bodies also read src1 as float4
+                const ggml_tensor * t = op->src[0];
+                const ggml_tensor * u = op->src[1];
+                const bool al2  = ((uintptr_t) t->data | t->nb[1] | t->nb[2] | t->nb[3]) %  2 == 0;
+                const bool al16 = ((uintptr_t) u->data | u->nb[1] | u->nb[2] | u->nb[3]) % 16 == 0;
+
+                v2  = use_v2(0) && al2;
                 nsg = N_SG_IQ3_S;
                 nr0 = N_R0_IQ3_S;
                 smem = 512*4 + (v2 ? 16*8 : 0);
@@ -1405,13 +1439,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     split = true;
                 }
 
-                // v2.1 body (kernel_mul_mv_iq3_s_f32_v2): byte and ushort loads, so 2-byte aligned blocks only; float4 loads of src1. it takes nr0 from FC_mul_mv_nr0
-                const ggml_tensor * t = op->src[0];
-                const ggml_tensor * u = op->src[1];
-                if (use_v2(9) && !split && ((uintptr_t) t->data | t->nb[1] | t->nb[2] | t->nb[3]) % 2 == 0 &&
-                                           ((uintptr_t) u->data | u->nb[1] | u->nb[2] | u->nb[3]) % 16 == 0) {
+                // v2.1 body (kernel_mul_mv_iq3_s_f32_v2), non-split; it takes nr0 from FC_mul_mv_nr0
+                if (use_v2(9) && !split && al2 && al16) {
                     v2     = true;
                     nr0    = ne01 >= N_R0_IQ3_S_V21 ? N_R0_IQ3_S_V21 : 1;
+                    suffix = "_v2";
+                    smem   = 512*4 + 16*4;
+                }
+
+                // v2.1s body (same entry), split mode (K = 256 or 512): nb, nr0 from FC_mul_mv_nb / _nr0
+                if (use_v2(11) && split && al2 && al16 && ggml_metal_mv_iq3_s_v21s(props, ne01, nb32, nb, nr0, nsg)) {
+                    v2     = true;
                     suffix = "_v2";
                     smem   = 512*4 + 16*4;
                 }
@@ -1481,7 +1519,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d_v2=%d_nr0=%d", base, nsg, ne12, r2, r3, split, tgg, v2, nr0);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_tgg=%d_v2=%d_nr0=%d_nb=%d", base, nsg, ne12, r2, r3, split, tgg, v2, nr0, nb);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1495,6 +1533,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_bool (cv, tgg,            FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, v2,             FC_MUL_MV + 7);
         ggml_metal_cv_set_int16(cv, nr0,            FC_MUL_MV + 8);
+        ggml_metal_cv_set_int16(cv, nb,             FC_MUL_MV + 11);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1750,6 +1789,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     bool split = false;
 
+    int nb = 0; // blocks per row of the iq3_s v2.1s body (FC_mul_mv_nb), 0 = not used
+
         // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
@@ -1869,7 +1910,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ3_S:
             {
-                v2  = use_v2(0);
+                // the v2 and v2.1 bodies read ushorts, so 2-byte aligned blocks only, including the expert stride (an odd src0
+                // address takes the v1 body); the v2.1 bodies also read src1 as float4
+                const ggml_tensor * t = op->src[0];
+                const ggml_tensor * u = op->src[1];
+                const bool al2  = ((uintptr_t) t->data | t->nb[1] | t->nb[2] | t->nb[3]) %  2 == 0;
+                const bool al16 = ((uintptr_t) u->data | u->nb[1] | u->nb[2] | u->nb[3]) % 16 == 0;
+
+                v2  = use_v2(0) && al2;
                 nsg = N_SG_IQ3_S;
                 nr0 = N_R0_IQ3_S;
                 smem = 512*4 + (v2 ? 16*8 : 0);
@@ -1878,6 +1926,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ3_S_SPLIT;
                     split = true;
+                }
+
+                // v2.1 bodies on mul_mv_id (bit 11; kernel_mul_mv_id_iq3_s_f32_v2): non-split rows take the v2.1 body (with bit 9,
+                // as in the dense getter), split rows (K = 256 or 512) the v2.1s body
+                if (use_v2(11) && al2 && al16) {
+                    if (split) {
+                        if (ggml_metal_mv_iq3_s_v21s(props, ne01, nb32, nb, nr0, nsg)) {
+                            v2     = true;
+                            suffix = "_v2";
+                            smem   = 512*4 + 16*4;
+                        }
+                    } else if (use_v2(9)) {
+                        v2     = true;
+                        nr0    = ne01 >= N_R0_IQ3_S_V21 ? N_R0_IQ3_S_V21 : 1;
+                        suffix = "_v2";
+                        smem   = 512*4 + 16*4;
+                    }
                 }
             } break;
         case GGML_TYPE_IQ2_S:
@@ -1941,7 +2006,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     };
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_split=%d_tgg=%d_v2=%d", base, nsg, split, tgg, v2);
+
+    // every function constant goes into the cache key: nr0 and nb select the compiled row map of the v2.1 bodies, while the
+    // dispatch sizes the grid from res.nr0, so two shapes with different nr0 must not share a pipeline
+    snprintf(name, 256, "%s_nsg=%d_split=%d_tgg=%d_v2=%d_nr0=%d_nb=%d", base, nsg, split, tgg, v2, nr0, nb);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1954,6 +2022,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_bool (cv, split, FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, tgg,   FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, v2,    FC_MUL_MV + 7);
+        ggml_metal_cv_set_int16(cv, nr0,   FC_MUL_MV + 8);
+        ggml_metal_cv_set_int16(cv, nb,    FC_MUL_MV + 11);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

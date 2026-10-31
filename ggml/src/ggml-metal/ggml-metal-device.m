@@ -1730,9 +1730,24 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 }
 
                 // v2 mat-vec bodies (FC_mul_mv_v2), only used on GPUs without simdgroup-mm
-                dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0x7ff;
-                if (dev->props.mv_v2 != 0x7ff) {
+                dev->props.mv_v2 = getenv("GGML_METAL_MV_V2") ? (int) strtol(getenv("GGML_METAL_MV_V2"), NULL, 0) : 0xfff;
+                if (dev->props.mv_v2 != 0xfff) {
                     GGML_LOG_INFO("%s: GGML_METAL_MV_V2=0x%x\n", __func__, dev->props.mv_v2);
+                }
+
+                // iq3_s v2.1s body (GGML_METAL_MV_V2 bit 11): rows per simdgroup and simdgroups per threadgroup (testing/tuning;
+                // invalid values fall back to the defaults)
+                dev->props.mv_v21s_nr0 = getenv("GGML_METAL_MV_V21S_NR0") ? atoi(getenv("GGML_METAL_MV_V21S_NR0")) : N_R0_IQ3_S_V21S;
+                dev->props.mv_v21s_nsg = getenv("GGML_METAL_MV_V21S_NSG") ? atoi(getenv("GGML_METAL_MV_V21S_NSG")) : N_SG_IQ3_S_V21S;
+                if (dev->props.mv_v21s_nr0 != 2 && dev->props.mv_v21s_nr0 != 4 && dev->props.mv_v21s_nr0 != 8 &&
+                    dev->props.mv_v21s_nr0 != 16 && dev->props.mv_v21s_nr0 != 32) {
+                    dev->props.mv_v21s_nr0 = N_R0_IQ3_S_V21S;
+                }
+                if (dev->props.mv_v21s_nsg != 1 && dev->props.mv_v21s_nsg != 2 && dev->props.mv_v21s_nsg != 4 && dev->props.mv_v21s_nsg != 8) {
+                    dev->props.mv_v21s_nsg = N_SG_IQ3_S_V21S;
+                }
+                if (dev->props.mv_v21s_nr0 != N_R0_IQ3_S_V21S || dev->props.mv_v21s_nsg != N_SG_IQ3_S_V21S) {
+                    GGML_LOG_INFO("%s: GGML_METAL_MV_V21S_NR0=%d GGML_METAL_MV_V21S_NSG=%d\n", __func__, dev->props.mv_v21s_nr0, dev->props.mv_v21s_nsg);
                 }
 
                 // grouped MoE matmul for prefill: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id

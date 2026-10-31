@@ -216,7 +216,8 @@ constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
 constant bool  FC_mul_mv_tgg   [[function_constant(FC_MUL_MV + 6)]]; // lookup grids in threadgroup memory
 constant bool  FC_mul_mv_v2    [[function_constant(FC_MUL_MV + 7)]]; // v2 mat-vec bodies (GPUs without simdgroup-mm)
-constant short FC_mul_mv_nr0   [[function_constant(FC_MUL_MV + 8)]]; // rows per simdgroup of the q3_K, q4_K v2 bodies (dense mul_mv only)
+constant short FC_mul_mv_nr0   [[function_constant(FC_MUL_MV + 8)]]; // rows per simdgroup of the v2 / v2.1 bodies that take it (q3_K .. q6_K dense, iq3_s / iq3_xxs v2.1)
+constant short FC_mul_mv_nb    [[function_constant(FC_MUL_MV + 11)]]; // blocks per row (1 or 2) of the iq3_s v2.1s body (split mode, K <= 512)
 
 // v2: sign masks for 4 packed grid bytes. entry n (0..15): .x has 0xFF in byte k if bit k of n is set, .y = .x & 0x01010101
 // 16 x 8 B = 128 B = all 32 LDS banks, so the uint2 reads have no bank conflicts
@@ -3575,6 +3576,197 @@ void kernel_mul_mv_iq3_s_f32_impl_v21(
     }
 }
 
+// transpose butterfly over the 2*S lanes {tiisg ^ x : x < 2*S}. each lane starts with CNT row partials v[0..CNT); a step
+// with offset s halves them: the lane with bit s clear keeps the first half, its partner the second, and each adds the
+// half its partner sends. r collects the row of the remaining value; once one value is left the steps are plain xor sums.
+// so a lane ends with the full sum of row r in v[0] (CNT <= 2*S), using CNT - 1 + log2(2*S/CNT) shuffles instead of
+// CNT*log2(2*S). compile-time recursion, so v is only indexed with constants
+template<short CNT, short S>
+struct mv_bfly {
+    static inline void run(thread float * v, thread short & r, ushort tiisg) {
+        constexpr short H = CNT/2;
+        if (CNT > 1) {
+            const bool hi = (tiisg & S) != 0;
+            FOR_UNROLL (short i = 0; i < H; ++i) {
+                const float keep = hi ? v[i + H] : v[i];
+                const float send = hi ? v[i] : v[i + H];
+                v[i] = keep + simd_shuffle_xor(send, (ushort) S);
+            }
+            r += hi ? H : 0;
+        } else {
+            v[0] += simd_shuffle_xor(v[0], (ushort) S);
+        }
+        mv_bfly<(CNT > 1 ? CNT/2 : 1), S/2>::run(v, r, tiisg);
+    }
+};
+
+template<short CNT>
+struct mv_bfly<CNT, 0> {
+    static inline void run(thread float *, thread short &, ushort) {}
+};
+
+// v2.1s (split mode, K = NB*256 with NB = 1 or 2): the v2.1 decode with no idle lanes. the 32 lanes are (row group g of
+// RG = 4/NB, block ix of NB, sub-block ib of 8): each lane decodes one 32-weight sub-block per row, and lane group g takes
+// rows g, g + RG, ... of the simdgroup's nr0 rows (compile-time, rows by byte stride). each lane loads its y sub-block once
+// for all its rows; the per-row partials are combined with a transpose butterfly over the 8*NB lanes of the group.
+// same LDS grid (g + 16 per byte), XOR 0x1E sign table and unsigned conversion as kernel_mul_mv_iq3_s_f32_impl_v21.
+// the host picks nr0 <= ne01, so the clamped first row keeps every read inside src0
+template<short NB, short nr0, typename args_t>
+void kernel_mul_mv_iq3_s_f32_impl_v21s(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg_,
+        ushort sgitg_) {
+    constexpr short RG = 4/NB;   // row groups per simdgroup
+    constexpr short NR = nr0/RG; // rows per lane
+    constexpr short NL = 8*NB;   // lanes per row group
+    static_assert(NB == 1 || NB == 2, "v2.1s: 1 or 2 blocks per row");
+    static_assert(nr0 % RG == 0 && NR >= 1 && NR <= NL, "v2.1s: nr0 must be a multiple of 4/NB and at most 32");
+
+    const int NSG   = FC_mul_mv_nsg;
+    const int tiisg = tiisg_;
+    const int sgitg = sgitg_;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // clamp to the last nr0 rows so the row tail stays inside src0 (see kernel_mul_mv_iq4_xs_f32_impl_v2)
+    const int first_row = min((r0*NSG + sgitg)*nr0, max(args.ne01 - nr0, 0));
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const int ib = tiisg%8;      // 32-weight sub-block
+    const int ix = (tiisg/8)%NB; // block of the row
+    const int g  = tiisg/NL;     // row group
+
+    const uint64_t offset0 = (first_row + g)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =               r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const uchar  * x  = (device const uchar *) (src0 + offset0);
+    device const float4 * y4 = (device const float4 *) ((device const float *) (src1 + offset1) + ix*QK_K + 32*ib);
+
+    // grid + 16 in each byte (512 x 4 B), then the sign masks: entry n has 0x1E in byte j if bit j of n is set (16 x 4 B)
+    threadgroup uint * sgrid = (threadgroup uint *) shmem;
+    threadgroup uint * ssgn  = sgrid + 512;
+    for (int i = 32*sgitg + tiisg; i < 512; i += 32*NSG) {
+        sgrid[i] = iq3s_grid[i] | 0x10101010u;
+    }
+    if (sgitg == 0 && tiisg < 16) {
+        ssgn[tiisg] = (((uint) tiisg*0x00204081u) & 0x01010101u)*0x1Eu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[8];
+    FOR_UNROLL (int i = 0; i < 8; ++i) {
+        yl[i] = y4[i];
+    }
+    const float4 t4 = ((yl[0] + yl[1]) + (yl[2] + yl[3])) + ((yl[4] + yl[5]) + (yl[6] + yl[7]));
+    const float  sy = 16.f*((t4[0] + t4[1]) + (t4[2] + t4[3]));
+
+    // lane field offsets in the row: d +0, qs +2+8*ib, qh +66+ib, signs +74+4*ib, scales +106+ib/2 (block ix)
+    const int ob = ix*(int) sizeof(block_iq3_s);
+    const int oq = ob +   2 + 8*ib;
+    const int oh = ob +  66 + ib;
+    const int os = ob +  74 + 4*ib;
+    const int oc = ob + 106 + ib/2;
+    const int cs = 4*(ib%2);
+
+    float sumf[NR];
+
+    FOR_UNROLL (short j = 0; j < NR; ++j) {
+        device const uchar * xr = x + (uint64_t) (j*RG)*args.nb01;
+
+        const uint  h  = xr[oh];
+        const uint  sc = xr[oc];
+        const float d  = (float) *((device const half *) (xr + ob)) * (float) (1 + 2*((sc >> cs) & 0xF));
+
+        // bit 8*l + j = sign of weight 8*l + j
+        const uint s = (uint) *((device const ushort *) (xr + os)) | ((uint) *((device const ushort *) (xr + os + 2)) << 16);
+
+        uint q[8];
+        FOR_UNROLL (int k = 0; k < 4; ++k) {
+            const uint w = *((device const ushort *) (xr + oq + 2*k));
+            q[2*k + 0] = w & 0xFF;
+            q[2*k + 1] = w >> 8;
+        }
+
+        // one fma chain, as in v2.1
+        float acc = -sy;
+        FOR_UNROLL (int k = 0; k < 8; ++k) {
+            const uint   gw = sgrid[q[k] | ((h << (8 - k)) & 256u)] ^ ssgn[(s >> 4*k) & 0xF];
+            const float4 f  = float4(as_type<uchar4>(gw));
+            acc = fma(yl[k][0], f[0], acc);
+            acc = fma(yl[k][1], f[1], acc);
+            acc = fma(yl[k][2], f[2], acc);
+            acc = fma(yl[k][3], f[3], acc);
+        }
+        sumf[j] = d*acc;
+    }
+
+    // after the butterfly, lane group g holds row j = r of its rows in every lane whose index bits below NL/NR are clear
+    short r = 0;
+    mv_bfly<NR, NL/2>::run(sumf, r, tiisg_);
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    const int row = first_row + r*RG + g;
+    if (tiisg%(NL/NR) == 0 && row < args.ne0) {
+        dst_f32[row] = sumf[0];
+    }
+}
+
+// iq3_s v2.1 dispatch: non-split rows take the v2.1 body (nr0 4, or 1 for ne01 < 4), split rows (K = 256 or 512) the
+// v2.1s body with FC_mul_mv_nb blocks per row and FC_mul_mv_nr0 rows per simdgroup. the host picks only the values
+// instantiated here (ggml_metal_library_get_pipeline_mul_mv, _mul_mv_id)
+template<typename args_t>
+void kernel_mul_mv_iq3_s_f32_v2_disp(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    if (FC_mul_mv_split) {
+        if (FC_mul_mv_nb == 2) {
+            if        (FC_mul_mv_nr0 == 32) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<2, 32, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else if (FC_mul_mv_nr0 == 16) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<2, 16, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else if (FC_mul_mv_nr0 ==  8) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<2,  8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else if (FC_mul_mv_nr0 ==  4) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<2,  4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<2,  2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            }
+        } else {
+            if        (FC_mul_mv_nr0 == 32) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<1, 32, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else if (FC_mul_mv_nr0 == 16) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<1, 16, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else if (FC_mul_mv_nr0 ==  8) {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<1,  8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            } else {
+                kernel_mul_mv_iq3_s_f32_impl_v21s<1,  4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            }
+        }
+        return;
+    }
+    if (FC_mul_mv_nr0 == N_R0_IQ3_S_V21) {
+        kernel_mul_mv_iq3_s_f32_impl_v21<N_R0_IQ3_S_V21, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_iq3_s_f32_impl_v21<1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 [[host_name("kernel_mul_mv_iq3_s_f32_v2")]]
 kernel void kernel_mul_mv_iq3_s_f32_v2(
         constant ggml_metal_kargs_mul_mv & args,
@@ -3585,11 +3777,7 @@ kernel void kernel_mul_mv_iq3_s_f32_v2(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    if (FC_mul_mv_nr0 == N_R0_IQ3_S_V21) {
-        kernel_mul_mv_iq3_s_f32_impl_v21<N_R0_IQ3_S_V21, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
-    } else {
-        kernel_mul_mv_iq3_s_f32_impl_v21<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
-    }
+    kernel_mul_mv_iq3_s_f32_v2_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -4808,6 +4996,7 @@ template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq2_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xs_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq3_xxs_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq3_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_id_iq3_s_f32_v2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_s_f32_v2_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_disp<ggml_metal_kargs_mul_mv>>>;

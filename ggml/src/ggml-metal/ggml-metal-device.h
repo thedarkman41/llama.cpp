@@ -326,7 +326,9 @@ struct ggml_metal_device_props {
 
     int mv_gqa; // GGML_METAL_MV_GQA: 1 = f16 x f32 mat-vecs with ne00 <= 512 and one src1 row per batch (decode KQ/KQV) read each src0 row once for its r2 src1 batches (kernel_mul_mv_f16_f32_gqa; default on GPUs without simdgroup-mm), 0 = off
 
-    int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K, 8 q5_K v2.1, 9 iq3_s v2.1, 10 iq3_xxs v2.1 (5-10 dense only; 8 overrides 4, 9 and 10 override 0 and 1 except in split mode); 0 = old kernels
+    int mv_v2; // GGML_METAL_MV_V2: bitmask of v2 mat-vec bodies on GPUs without simdgroup-mm: bit 0 iq3_s, 1 iq3_xxs, 2 iq2_s, 3 iq4_xs, 4 q5_K nr0=2, 5 q3_K, 6 q4_K, 7 q6_K, 8 q5_K v2.1, 9 iq3_s v2.1, 10 iq3_xxs v2.1, 11 iq3_s v2.1 on mul_mv_id (non-split with bit 9) and the iq3_s v2.1s split-mode body (K <= 512, dense and mul_mv_id) (5-10 dense only; 8 overrides 4, 9 and 10 override 0 and 1 except in split mode, 11 overrides 0); default 0xfff; 0 = old kernels
+    int mv_v21s_nr0; // GGML_METAL_MV_V21S_NR0: rows per simdgroup of the iq3_s v2.1s body for ne01 >= this value (default N_R0_IQ3_S_V21S; one of 2, 4, 8, 16, 32, at least 4/NB; testing/tuning)
+    int mv_v21s_nsg; // GGML_METAL_MV_V21S_NSG: simdgroups per threadgroup of the iq3_s v2.1s body (default N_SG_IQ3_S_V21S; 1, 2, 4 or 8; testing/tuning)
 
     int moe_wl;     // GGML_METAL_MOE_WL: 2 = kernel_mul_mm_id_wl with BK = 64 (default), 1 = BK = 32, 0 = mul_mv_id
     int moe_wl_min; // GGML_METAL_MOE_WL_MIN: least average routed tokens per expert for kernel_mul_mm_id_wl (default 1), 0 = any batch (testing)

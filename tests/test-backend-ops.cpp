@@ -5729,6 +5729,77 @@ struct test_mul_mat_id_skew : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID with views: strided src1 rows (k_v > k), an expert stride that is not a multiple of the row stride (pad bytes
+// added to m_v rows) and a byte offset of the as view (an odd offset misaligns every block). the as rows are written one by
+// one at their view positions, so every row the op reads holds valid blocks whatever the offset
+struct test_mul_mat_id_v : public test_mul_mat_id {
+    const int64_t k_v;  // src1 row length in memory, 0 = contiguous
+    const int64_t pad;  // bytes added to the expert stride of as (m_v rows + pad)
+    const int64_t offs; // byte offset of the as view
+
+    test_mul_mat_id_v(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k,
+            int64_t m_v, int64_t k_v, int64_t pad, int64_t offs)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k, 1.0f, m_v), k_v(k_v), pad(pad), offs(offs) {
+            GGML_ASSERT(m_v > m);
+            GGML_ASSERT(k_v == 0 || k_v > k);
+        }
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",k_v=" + std::to_string(k_v) + ",pad=" + std::to_string(pad) + ",offs=" + std::to_string(offs);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // one spare row per expert covers pad and offs (both < one row)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m_v + 1, n_mats);
+        GGML_ASSERT(pad < (int64_t) as->nb[1] && offs < (int64_t) as->nb[1]);
+        ggml_set_name(as, "as_base");
+        as = ggml_view_3d(ctx, as, k, m, n_mats, as->nb[1], m_v*as->nb[1] + pad, offs);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k_v == 0 ? k : k_v, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b_base");
+        if (k_v != 0) {
+            b = ggml_view_3d(ctx, b, k, b->ne[1], n, b->nb[1], b->nb[2], 0);
+        }
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+
+        // rewrite the as view row by row with valid blocks
+        ggml_tensor * as = ggml_get_tensor(ctx, "as");
+        GGML_ASSERT(as != nullptr);
+
+        const size_t rs = ggml_row_size(as->type, k);
+        std::vector<float>   rowf(k);
+        std::vector<uint8_t> rowq(rs);
+        std::default_random_engine rng(4321 + m + k);
+        std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+        for (int64_t e = 0; e < n_mats; e++) {
+            for (int64_t r = 0; r < m; r++) {
+                for (auto & v : rowf) {
+                    v = ud(rng);
+                }
+                ggml_quantize_chunk(as->type, rowf.data(), rowq.data(), 0, 1, k, nullptr);
+                ggml_backend_tensor_set(as, rowq.data(), e*as->nb[2] + r*as->nb[1], rs);
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -10936,6 +11007,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003, 330));
+    // Metal iq3_s v2.1s mat-vec (split mode, k 256 and 512, GGML_METAL_MV_V2 bit 11): m < 4/NB rows falls back (n = 8 so the
+    // NMSE has enough outputs), smaller m than the default nr0 take nr0 = 4/NB, the rest the default with row tails; n 1..8;
+    // broadcast batches; strided batches (m_v)
+    for (int64_t k : {512, 256}) {
+        for (int64_t m : {1, 2, 3}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, m, 8, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t m : {4, 5, 15, 16, 17, 37, 1001, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t n = 2; n <= 8; n++) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 37, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32,   64, 1, k, {3, 2}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 1001, 1, k, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 1003));
+    }
     // Metal iq3_xxs v2.1 mat-vec (non-split k): the iq3_s v2.1 cases (pad = 3 blocks of 98 B), plus nr0 = 1 (m < 4) with n = 8 so the NMSE has enough outputs
     for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{5, 768}, {6, 1024}, {9, 5120}, {513, 768}, {2049, 1280}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
@@ -10953,6 +11040,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 2048, 1, 512));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 1001, 1, 2048)); // row tail
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false,   37, 1, 512));
+    }
+    // Metal iq3_s v2.1 bodies on mul_mv_id (GGML_METAL_MV_V2 bit 11): K 256 and 512 take the split-mode v2.1s body (NB = 1, 2),
+    // K 2048 the v2.1 body; n 1..8. m 5 (and m 15 under nr0 16 / 32) has fewer rows than the default nr0 (8): 4/NB rows per
+    // simdgroup; row tails at 15, 37, 1001. the small m run first, so pipelines that differ only in nr0 (or in NB: K 256 vs
+    // 512) are compiled in one process and must not share a cache entry. then the src1 broadcast (b = true)
+    for (int64_t k : {512, 256}) {
+        for (int64_t m : {5, 15, 37, 1001, 2048}) {
+            for (int64_t n = 1; n <= 8; n++) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 16, 8, false, m, n, k));
+            }
+        }
+    }
+    for (int64_t m : {5, 15, 37, 512}) {
+        for (int64_t n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 16, 8, false, m, n, 2048));
+        }
+    }
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{37, 2048}, {512, 2048}, {15, 512}, {2048, 512}, {37, 256}}) {
+        for (int64_t n : {1, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 16, 8, true, m, n, k));
+        }
+    }
+    // the same with views: strided src1 rows (k_v; a 16-byte multiple keeps v2.1, an 8-byte one falls back), strided experts
+    // (m_v = m + 1, m + 3), an expert stride that is not a multiple of the row stride (pad 2 keeps v2.1; pad 1 is odd) and an
+    // as view at byte offset 2 (keeps v2.1) or 1. odd src0 addresses must take the v1 body: the v2 and v2.1 bodies read ushorts
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2048, 512}, {37, 512}, {1001, 256}, {37, 2048}}) {
+        for (auto [m_v, k_v, pad, offs] : std::vector<std::array<int64_t, 4>>{
+                {m + 1, k + 4, 0, 0}, {m + 1, k + 2, 0, 0}, {m + 3, 0, 0, 0}, {m + 1, 0, 2, 0}, {m + 1, 0, 1, 0}, {m + 1, 0, 0, 2}, {m + 1, 0, 0, 1}, {m + 3, 0, 2, 2}}) {
+            test_cases.emplace_back(new test_mul_mat_id_v(GGML_TYPE_IQ3_S, 16, 8, false, m, 4, k, m_v, k_v, pad, offs));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_v(GGML_TYPE_IQ3_S, 16, 8, true, m, 3, k, m + 1, k + 4, 2, 2));
     }
     // Metal v2 q3_K / q4_K / q5_K / q6_K mat-vec: every nr0 (q3_K 1, 2, 4; q4_K, q5_K, q6_K 1, 2), odd m for the row tail, odd superblock count, broadcast
     for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
@@ -12641,6 +12759,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 1, 2048));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
+    }
+    // qwen3.6-35B-A3B iq3_s down projection at 2 and 4 sequences (batched decode)
+    for (int n : {2, 4}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
     }
 
     // qwen3-30b-a3b
